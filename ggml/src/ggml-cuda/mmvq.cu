@@ -403,6 +403,14 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// RDNA3 (gfx1100-1102) decode: PQ2_0 otherwise falls through to 1 warp/block.
+#ifndef PRISM_RDNA3_PQ2_0_NWARPS
+#define PRISM_RDNA3_PQ2_0_NWARPS 2
+#endif
+#ifndef PRISM_RDNA3_PQ2_0_ROWS
+#define PRISM_RDNA3_PQ2_0_ROWS 4
+#endif
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
@@ -473,6 +481,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 2;
                 case GGML_TYPE_IQ4_NL:
                     return 8;
+                case GGML_TYPE_PQ2_0:
+                    return PRISM_RDNA3_PQ2_0_NWARPS;
                 default:
                     return 1;
             }
@@ -534,7 +544,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, ggml_type type = GGML_TYPE_COUNT) {
+    // PQ2_0 weights are tiny next to q8_1 activations, so reuse each activation load for several rows.
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_PQ2_0 && ncols_dst == 1) {
+        return PRISM_RDNA3_PQ2_0_ROWS;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -573,7 +587,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -922,7 +936,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1434,13 +1448,17 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    // the cache holds unpadded rows, so it only matches when no padding is needed
+    const block_q8_1 * src1_q8_1_cached = !ids && ne10 == ne10_padded ? ggml_cuda_q8_1_cache_get(ctx, src1) : nullptr;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (!src1_q8_1_cached) {
+        src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
+    const void * src1_q8_1_d = src1_q8_1_cached ? (const void *) src1_q8_1_cached : (const void *) src1_q8_1.get();
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -1465,7 +1483,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

@@ -21,6 +21,12 @@ void quantize_row_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// Reserve a q8_1 cache slot for node (an FWHT output). Returns nullptr if the cache cannot be used.
+block_q8_1 * ggml_cuda_q8_1_cache_put(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
+
+// q8_1 data for src1 if it is a cached FWHT output (or a view/reshape of one), else nullptr.
+const block_q8_1 * ggml_cuda_q8_1_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1);
+
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,

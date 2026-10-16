@@ -144,6 +144,9 @@
 #define cudaKernelNodeParams musaKernelNodeParams
 #define cudaStreamCaptureModeRelaxed musaStreamCaptureModeRelaxed
 #define cudaStreamBeginCapture musaStreamBeginCapture
+#define cudaStreamCaptureStatus musaStreamCaptureStatus
+#define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
+#define cudaStreamIsCapturing musaStreamIsCapturing
 #define cudaStreamEndCapture musaStreamEndCapture
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor musaOccupancyMaxActiveBlocksPerMultiprocessor
 

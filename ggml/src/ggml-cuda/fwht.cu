@@ -1,7 +1,9 @@
 #include "common.cuh"
 #include "fwht.cuh"
+#include "quantize.cuh"
 
 #include <cstdlib>
+#include <cstring>
 
 template <typename T>
 __device__ __forceinline__ float fwht_load(const T value) {
@@ -134,38 +136,15 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
 // Both leave most of the GPU idle at these shapes.
 #define FWHT_BLOCK_THREADS 256
 
-template <int N, int NT, typename T, bool has_signs>
-__launch_bounds__(NT, 1)
-__global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
-                                const float * signs, const int n_blk) {
+// FWHT stages on one N-wide row held as NE = N/NT registers per thread, then store dst (and q8_1).
+template <int N, int NT>
+static __device__ __forceinline__ void fwht_block_finish(float (&reg)[N / NT], float * s, const int64_t r,
+                                                         float * dst, block_q8_1 * q8) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
-    static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
-
-    __shared__ float s[N];
-
-    const int64_t r = blockIdx.x;
-    if (r >= n_rows) {
-        return;
-    }
-
-    src += r * N;
-    dst += r * N;
 
     const int tid  = threadIdx.x;
     const int lane = tid % warp_size;
-
-    ggml_cuda_pdl_sync();
-    const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
-
-    float reg[NE];
-#pragma unroll
-    for (int i = 0; i < NE; ++i) {
-        reg[i] = fwht_load(src[i * NT + tid]) * scale;
-        if (has_signs) {
-            reg[i] *= signs_row[i * NT + tid];
-        }
-    }
 
     // stages within a warp: partner differs in the lane bits
 #pragma unroll
@@ -211,16 +190,178 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
         }
     }
 
+    dst += r * N;
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
         dst[i * NT + tid] = reg[i];
+    }
+
+    // same math as quantize_q8_1: a warp holds 32 consecutive values, one q8_1 block
+    if (q8 != nullptr) {
+#pragma unroll
+        for (int i = 0; i < NE; ++i) {
+            const float xi   = reg[i];
+            const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+            const float sum  = warp_reduce_sum<QK8_1>(xi);
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+            const int64_t idx = r * N + i * NT + tid;
+            block_q8_1 & b = q8[idx / QK8_1];
+            b.qs[idx % QK8_1] = q;
+            if (idx % QK8_1 == 0) {
+                b.ds = make_half2(d, sum);
+            }
+        }
+    }
+}
+
+template <int N, int NT, typename T, bool has_signs>
+__launch_bounds__(NT, 1)
+__global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
+                                const float * signs, const int n_blk, block_q8_1 * q8) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int NE        = N / NT;
+    static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
+
+    __shared__ float s[N];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+
+    src += r * N;
+
+    const int tid = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        reg[i] = fwht_load(src[i * NT + tid]) * scale;
+        if (has_signs) {
+            reg[i] *= signs_row[i * NT + tid];
+        }
+    }
+
+    fwht_block_finish<N, NT>(reg, s, r, dst, q8);
+}
+
+// rms_norm * weight -> norm_dst, then sign flip + FWHT of it, one block per N-wide chunk of a row.
+// Each block reads the full row for the norm sum and writes only its own chunk.
+template <int N, int NT>
+__launch_bounds__(NT, 1)
+__global__ void fwht_rms_norm_block(const float * x, const float * w, float * norm_dst, float * dst,
+                                    const int ncols, const float eps, const float scale,
+                                    const float * signs, const int n_blk, block_q8_1 * q8) {
+    constexpr int NE = N / NT;
+
+    __shared__ float s[N];
+    __shared__ float s_sum[32];
+
+    const int64_t r     = blockIdx.x;
+    const int     chunk = r % (ncols / N);
+    const int64_t row   = r / (ncols / N);
+    const int     tid   = threadIdx.x;
+
+    x        += row * ncols;
+    norm_dst += row * ncols;
+
+    ggml_cuda_pdl_sync();
+    // Sum in the same order as rms_norm_f32, which runs vt = 256 or 1024 threads: thread tid acts as the
+    // virtual threads tid + k*NT, and each warp of them gives the same warp sum as there.
+    const int vt = ncols < 1024 ? 256 : 1024;
+    for (int k = 0; k < vt / NT; ++k) {
+        const int v = tid + k * NT;
+        float tmp = 0.0f;
+        for (int col = v; col < ncols; col += vt) {
+            const float xi = x[col];
+            tmp += xi * xi;
+        }
+        tmp = warp_reduce_sum(tmp);
+        if (v % WARP_SIZE == 0) {
+            s_sum[v / WARP_SIZE] = tmp;
+        }
+    }
+    __syncthreads();
+    const int   lane   = tid % WARP_SIZE;
+    const float sum    = warp_reduce_sum(lane < vt / WARP_SIZE ? s_sum[lane] : 0.0f);
+    const float rscale = rsqrtf(sum / ncols + eps);
+
+    const float * signs_row = signs + (r % n_blk) * N;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const int   col = chunk * N + i * NT + tid;
+        const float y   = rscale * x[col] * w[col];
+        norm_dst[col] = y;
+        reg[i] = y * scale * signs_row[i * NT + tid];
+    }
+
+    fwht_block_finish<N, NT>(reg, s, r, dst, q8);
+}
+
+bool ggml_cuda_op_rms_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul,
+                                const ggml_tensor * signs, ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_CUDA_NO_RMS_FWHT") != nullptr || getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    const int     n     = dst->ne[0];
+    const int     ncols = x->ne[0];
+    const int64_t rows  = ggml_nrows(x);
+
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(w) || !ggml_is_contiguous(signs) ||
+        !ggml_is_contiguous(mul) || !ggml_is_contiguous(dst) ||
+        ggml_nrows(w) != 1 || w->ne[0] != ncols || signs->ne[0] != ncols || ggml_nrows(signs) != 1 ||
+        ncols % n != 0 || ggml_nelements(dst) != rows * ncols || ggml_nelements(mul) != rows * ncols) {
+        return false;
+    }
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    const float scale = 1 / sqrtf(n);
+    const int   n_blk = ncols / n;
+
+    const dim3 g((unsigned) (rows * n_blk), 1, 1), b(FWHT_BLOCK_THREADS, 1, 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, ctx.stream());
+
+    const float * x_d = (const float *) x->data;
+    const float * w_d = (const float *) w->data;
+    const float * s_d = (const float *) signs->data;
+    float * norm_d = (float *) mul->data;
+    float * dst_d  = (float *) dst->data;
+
+    switch (n) {
+#define RMS_FWHT_CASE(NN) \
+        case NN: { \
+            block_q8_1 * q8 = ggml_cuda_q8_1_cache_put(ctx, dst); \
+            ggml_cuda_kernel_launch(fwht_rms_norm_block<NN, FWHT_BLOCK_THREADS>, lp, x_d, w_d, norm_d, dst_d, ncols, eps, scale, s_d, n_blk, q8); \
+            return true; \
+        }
+        RMS_FWHT_CASE(512)
+        RMS_FWHT_CASE(1024)
+        RMS_FWHT_CASE(2048)
+        RMS_FWHT_CASE(4096)
+        RMS_FWHT_CASE(8192)
+#undef RMS_FWHT_CASE
+        default:
+            return false;
     }
 }
 
 template <typename T>
 static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
                         const int n, const int64_t rows, const float scale,
-                        const float * signs, const int n_blk) {
+                        const float * signs, const int n_blk, const ggml_tensor * dst) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int rows_per_block = 4;
     const int64_t num_blocks = (rows + rows_per_block - 1) / rows_per_block;
@@ -263,10 +404,11 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         case NN: { \
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1); \
             const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
+            block_q8_1 * q8 = ggml_cuda_q8_1_cache_put(ctx, dst); \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk, q8); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1, q8); \
             } \
             return true; \
         }
@@ -323,9 +465,9 @@ static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const float scale = 1 / sqrtf(n);
 
     if (src->type == GGML_TYPE_F32) {
-        return fwht_launch<float>(ctx, (const float *) src->data, dst_d, n, rows, scale, signs, n_blk);
+        return fwht_launch<float>(ctx, (const float *) src->data, dst_d, n, rows, scale, signs, n_blk, dst);
     }
-    return fwht_launch<half>(ctx, (const half *) src->data, dst_d, n, rows, scale, signs, n_blk);
+    return fwht_launch<half>(ctx, (const half *) src->data, dst_d, n, rows, scale, signs, n_blk, dst);
 }
 
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {

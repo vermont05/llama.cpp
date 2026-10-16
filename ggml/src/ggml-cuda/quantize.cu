@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "mmvq.cuh"
 #include "unary.cuh"
 #include <cstdint>
 
@@ -774,4 +775,61 @@ void quantize_mmq_fp4_cuda(
 
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
+}
+
+static bool ggml_cuda_q8_1_cache_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_NO_Q8_1_CACHE") == nullptr;
+    return enabled;
+}
+
+block_q8_1 * ggml_cuda_q8_1_cache_put(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    const int64_t ne = ggml_nelements(node);
+    // mmvq, the only reader, takes at most MMVQ_MAX_BATCH_SIZE columns; larger batches (prompts) never hit
+    if (ne > MMVQ_MAX_BATCH_SIZE * 32768) {
+        return nullptr;
+    }
+    if (!ggml_cuda_q8_1_cache_enabled() || ctx.curr_stream_no != 0 || ne % QK8_1 != 0 || !ggml_is_contiguous(node)) {
+        return nullptr;
+    }
+    ggml_cuda_q8_1_cache & c = ctx.q8_1_cache;
+    ggml_cuda_q8_1_cache::slot & s = c.slots[c.next];
+    const size_t size = ne / QK8_1 * sizeof(block_q8_1);
+    if (s.size < size) {
+        // no allocation while a graph is being captured
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &status));
+        if (status != cudaStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        if (s.buf != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            CUDA_CHECK(cudaFree(s.buf));
+        }
+        CUDA_CHECK(cudaMalloc((void **) &s.buf, size));
+        s.size = size;
+    }
+    s.node  = node;
+    s.data  = node->data;
+    s.ne    = ne;
+    s.epoch = c.epoch;
+    c.next  = (c.next + 1) % ggml_cuda_q8_1_cache::n_slots;
+    return (block_q8_1 *) s.buf;
+}
+
+const block_q8_1 * ggml_cuda_q8_1_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
+    if (!ggml_cuda_q8_1_cache_enabled() || ctx.curr_stream_no != 0 || !ggml_is_contiguous(src1)) {
+        return nullptr;
+    }
+    // walk the op chain, not view_src: view_src skips in-place ops that change the data
+    const ggml_tensor * root = src1;
+    while (root->op == GGML_OP_RESHAPE || root->op == GGML_OP_VIEW) {
+        root = root->src[0];
+    }
+    const ggml_cuda_q8_1_cache & c = ctx.q8_1_cache;
+    for (const auto & s : c.slots) {
+        if (s.epoch == c.epoch && s.node == root && s.data == src1->data && s.ne == ggml_nelements(src1)) {
+            return (const block_q8_1 *) s.buf;
+        }
+    }
+    return nullptr;
 }

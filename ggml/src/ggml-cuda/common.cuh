@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1453,10 +1454,39 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// q8_1 copies of FWHT outputs, so the matmuls that read them skip their own quantize pass.
+// A slot is valid only for its node within one graph_compute call (epoch).
+struct ggml_cuda_q8_1_cache {
+    static constexpr int n_slots = 4;
+    struct slot {
+        const ggml_tensor * node  = nullptr;
+        const void *        data  = nullptr;
+        int64_t             ne    = 0;
+        uint64_t            epoch = 0;
+        char *              buf   = nullptr;
+        size_t              size  = 0;
+    };
+    slot     slots[n_slots];
+    int      next  = 0;
+    uint64_t epoch = 1;
+};
+
+// gated_delta_net reads its input state straight from the recurrent cache row, and the gather is skipped
+struct ggml_cuda_gdn_rows {
+    const float *   state = nullptr; // cache rows, row stride = row_stride floats
+    const int32_t * rows  = nullptr; // device row index per seq
+    int64_t         row_stride = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_q8_1_cache q8_1_cache;
+
+    std::unordered_map<const ggml_tensor *, ggml_cuda_gdn_rows> gdn_rows;      // gdn node -> cache read
+    std::unordered_set<const ggml_tensor *>                     gdn_rows_skip; // skipped get_rows nodes
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
