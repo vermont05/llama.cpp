@@ -490,10 +490,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 case GGML_TYPE_IQ2_S:
                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
                 case GGML_TYPE_PQ2_0: {
-                    // f16 dequant + hipBLAS (WMMA) beats the PQ2_0 MMQ tiles above ~128 tokens on RDNA3 (272 vs 158 t/s at pp512)
+                    // With the HIP tile unpack, MMQ matches f16 dequant + hipBLAS on RDNA3 and needs no f16 copy of
+                    // the weights. Set this to use hipBLAS above the given batch size instead (A/B knob).
                     static const int64_t max_batch = [] {
                         const char * s = getenv("GGML_CUDA_PQ2_0_MMQ_MAX_BATCH");
-                        return s ? (int64_t) atoll(s) : (int64_t) 128;
+                        return s ? (int64_t) atoll(s) : INT64_MAX;
                     }();
                     return ne11 <= max_batch;
                 }
