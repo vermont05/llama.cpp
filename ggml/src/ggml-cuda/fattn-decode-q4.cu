@@ -34,6 +34,36 @@ static __device__ __forceinline__ void fattn_dq4_wave_sync() {
 #endif // GGML_USE_HIP
 }
 
+#if defined(GGML_USE_HIP) && defined(RDNA)
+// Lane exchanges without the LDS crossbar: DPP row_xmask for xor 1..8 within a row of 16, permlanex16 for xor 16.
+template <int mask>
+static __device__ __forceinline__ float fattn_dq4_xor(const float x) {
+    if constexpr (mask == 16) {
+        return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(x), __float_as_int(x), 0x76543210, 0xfedcba98, false, false));
+    } else {
+        return __int_as_float(__builtin_amdgcn_update_dpp(__float_as_int(x), __float_as_int(x), 0x160 | mask, 0xF, 0xF, false));
+    }
+}
+#endif // defined(GGML_USE_HIP) && defined(RDNA)
+
+#if defined(GGML_USE_HIP) && defined(RDNA)
+// Byte k of x as a float in one instruction; the compiler emits v_bfe_u32 + v_cvt_f32_ubyte0 instead.
+template <int k>
+static __device__ __forceinline__ float fattn_dq4_ubyte(const uint32_t x) {
+    float f;
+    if constexpr (k == 0) {
+        asm("v_cvt_f32_ubyte0 %0, %1" : "=v"(f) : "v"(x));
+    } else if constexpr (k == 1) {
+        asm("v_cvt_f32_ubyte1 %0, %1" : "=v"(f) : "v"(x));
+    } else if constexpr (k == 2) {
+        asm("v_cvt_f32_ubyte2 %0, %1" : "=v"(f) : "v"(x));
+    } else {
+        asm("v_cvt_f32_ubyte3 %0, %1" : "=v"(f) : "v"(x));
+    }
+    return f;
+}
+#endif // defined(GGML_USE_HIP) && defined(RDNA)
+
 // 4 bytes starting at byte offset off (a multiple of 2) of a 4-byte aligned shared buffer.
 static __device__ __forceinline__ uint32_t fattn_dq4_load_u32_a2(const uint32_t * buf, const int off) {
     const uint32_t lo = buf[off/4];
@@ -41,8 +71,16 @@ static __device__ __forceinline__ uint32_t fattn_dq4_load_u32_a2(const uint32_t 
     return (off & 2) ? __builtin_amdgcn_alignbyte(hi, lo, 2) : lo;
 }
 
+#ifndef PRISM_FA_DQ4_WAVES_PER_EU
+#define PRISM_FA_DQ4_WAVES_PER_EU 4
+#endif
+
 template <int G>
+#ifdef GGML_USE_HIP
+__attribute__((amdgpu_flat_work_group_size(fattn_dq4_nwarps*WARP_SIZE, fattn_dq4_nwarps*WARP_SIZE), amdgpu_waves_per_eu(PRISM_FA_DQ4_WAVES_PER_EU)))
+#else
 __launch_bounds__(fattn_dq4_nwarps*WARP_SIZE, 1)
+#endif // GGML_USE_HIP
 static __global__ void flash_attn_ext_decode_q4_0(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -87,15 +125,19 @@ static __global__ void flash_attn_ext_decode_q4_0(
     V += nb23*sequence + int64_t(nb22)*head_kv;
     const half * maskh = (const half *) (mask + nb33*(sequence % ne33));
 
-    __shared__ int      Q_qs[G][NB][QI8_1];
+    __shared__ __align__(16) int Q_qs[G][NB][QI8_1];
     __shared__ float2   Q_ds[G][NB];
-    // Per-warp staging; one extra 16 bytes so the unaligned 4-byte reads of the last block stay in bounds.
-    __shared__ uint4    KV_s[nwarps][2][R*fattn_dq4_row_u4 + 1];
+    // Per-warp K/V staging (one extra 16 bytes so the unaligned 4-byte reads of the last block stay in bounds).
+    // The merged output O_s reuses the same memory after the main loop.
+    constexpr int ne_stage = nwarps*2*(R*fattn_dq4_row_u4 + 1);
+    static_assert(ne_stage*16 >= G*D*4, "staging too small for O_s");
+    __shared__ uint4    KV_s_raw[ne_stage];
     __shared__ float    P_s[nwarps][R][G];
-    __shared__ float    O_s[G][D];
     __shared__ float2   ml_s[nwarps][G];
+    float (*O_s)[D] = (float (*)[D]) KV_s_raw;
 
-    // Q * scale -> q8_1, one 32-value block per thread.
+    // Q * scale * log2(e) -> q8_1, one 32-value block per thread. The softmax below works in base 2.
+    const float scale_l2 = scale*1.4426950408889634f;
     for (int t = tid; t < G*NB; t += nwarps*WARP_SIZE) {
         const int h = t / NB;
         const int b = t - h*NB;
@@ -105,7 +147,7 @@ static __global__ void flash_attn_ext_decode_q4_0(
 #pragma unroll
         for (int i = 0; i < QK8_1/4; ++i) {
             const float4 x = x4[i];
-            v[4*i + 0] = x.x*scale; v[4*i + 1] = x.y*scale; v[4*i + 2] = x.z*scale; v[4*i + 3] = x.w*scale;
+            v[4*i + 0] = x.x*scale_l2; v[4*i + 1] = x.y*scale_l2; v[4*i + 2] = x.z*scale_l2; v[4*i + 3] = x.w*scale_l2;
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 amax = fmaxf(amax, fabsf(v[4*i + k]));
@@ -127,69 +169,82 @@ static __global__ void flash_attn_ext_decode_q4_0(
         }
         Q_ds[h][b] = make_float2(d, d*sum);
     }
-    for (int t = tid; t < G*D/4; t += nwarps*WARP_SIZE) {
-        ((float4 *) O_s)[t] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    }
     __syncthreads();
 
     // QK role: lane handles q4_0 block kb of row kr of each group of 4 rows.
     const int kb = lane % NB;
     const int kr = lane / NB;
-    int    q_reg[G][QI8_1];
-    float2 qd_reg[G];
-#pragma unroll
-    for (int h = 0; h < G; ++h) {
-#pragma unroll
-        for (int i = 0; i < QI8_1; ++i) {
-            q_reg[h][i] = Q_qs[h][kb][i];
-        }
-        qd_reg[h] = Q_ds[h][kb];
-    }
 
     // PV role: lane handles dims 32*vb + 4*vj + {0..3} and 32*vb + 16 + 4*vj + {0..3}.
     const int vb = lane / 4;
     const int vj = lane % 4;
     float acc[G][8];
     float csum[G]; // sum of P*d_V, for the -8 offset of q4_0
-    float KQ_max[G];
-    float KQ_sum[G];
 #pragma unroll
     for (int h = 0; h < G; ++h) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             acc[h][i] = 0.0f;
         }
-        csum[h]   = 0.0f;
-        KQ_max[h] = -FLT_MAX/2.0f;
-        KQ_sum[h] = 0.0f;
+        csum[h] = 0.0f;
     }
+    // Softmax role: after the reduce-scatter below, lane holds the scores of head hs = lane % 8 (heads >= G are
+    // padding) for rows p*4 + kr; it keeps the running max and sum of that head.
+    static_assert(G <= NB, "too many Q heads per K/V head");
+    const int hs = lane % NB;
+    float KQ_max = -FLT_MAX/2.0f;
+    float KQ_sum = 0.0f;
 
-    uint4 * K_s = KV_s[warp][0];
-    uint4 * V_s = KV_s[warp][1];
+    uint4 * K_s = KV_s_raw + (2*warp + 0)*(R*fattn_dq4_row_u4 + 1);
+    uint4 * V_s = KV_s_raw + (2*warp + 1)*(R*fattn_dq4_row_u4 + 1);
     const uint32_t * K_s32 = (const uint32_t *) K_s;
     const uint32_t * V_s32 = (const uint32_t *) V_s;
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
 
-    for (int t0 = blockIdx.y*fattn_dq4_tile; t0 < k_VKQ_max; t0 += gridDim.y*fattn_dq4_tile) {
+    // The lane's share of a warp tile, prefetched into registers one tile ahead.
+    // Named registers, not arrays: the compiler kept arrays of uint4 here in scratch memory.
+    static_assert(R*fattn_dq4_row_u4 > 4*WARP_SIZE && R*fattn_dq4_row_u4 <= 5*WARP_SIZE, "prefetch assumes 5 loads per lane");
+    const bool ld4 = 4*WARP_SIZE + lane < R*fattn_dq4_row_u4;
+    uint4 pk0, pk1, pk2, pk3, pk4 = make_uint4(0, 0, 0, 0);
+    uint4 pv0, pv1, pv2, pv3, pv4 = make_uint4(0, 0, 0, 0);
+#define FATTN_DQ4_LD(j, row0_load, dk, dv) {                                                    \
+        const int i = (j)*WARP_SIZE + lane;                                                     \
+        const int r = i / fattn_dq4_row_u4;                                                     \
+        const int c = i - r*fattn_dq4_row_u4;                                                   \
+        dk = ((const uint4 *) (K + int64_t((row0_load) + r)*nb11))[c];                          \
+        dv = ((const uint4 *) (V + int64_t((row0_load) + r)*nb21))[c];                          \
+    }
+#define FATTN_DQ4_LOAD_TILE(row0_load) {                                                        \
+        FATTN_DQ4_LD(0, row0_load, pk0, pv0); FATTN_DQ4_LD(1, row0_load, pk1, pv1);             \
+        FATTN_DQ4_LD(2, row0_load, pk2, pv2); FATTN_DQ4_LD(3, row0_load, pk3, pv3);             \
+        if (ld4) { FATTN_DQ4_LD(4, row0_load, pk4, pv4); }                                      \
+    }
+
+    int t0 = blockIdx.y*fattn_dq4_tile;
+    if (t0 < k_VKQ_max) {
+        FATTN_DQ4_LOAD_TILE(t0 + warp*R);
+    }
+    for (; t0 < k_VKQ_max; t0 += gridDim.y*fattn_dq4_tile) {
         const int row0 = t0 + warp*R;
 
-        // Stage this warp's K and V rows.
+        // Stage this warp's K and V rows, then start loading the next tile.
         fattn_dq4_wave_sync(); // the previous tile's reads are done
-#pragma unroll
-        for (int i0 = 0; i0 < R*fattn_dq4_row_u4; i0 += WARP_SIZE) {
-            const int i = i0 + lane;
-            if (i0 + WARP_SIZE <= R*fattn_dq4_row_u4 || i < R*fattn_dq4_row_u4) {
-                const int r = i / fattn_dq4_row_u4;
-                const int c = i - r*fattn_dq4_row_u4;
-                K_s[i] = ((const uint4 *) (K + int64_t(row0 + r)*nb11))[c];
-                V_s[i] = ((const uint4 *) (V + int64_t(row0 + r)*nb21))[c];
-            }
+        K_s[0*WARP_SIZE + lane] = pk0; V_s[0*WARP_SIZE + lane] = pv0;
+        K_s[1*WARP_SIZE + lane] = pk1; V_s[1*WARP_SIZE + lane] = pv1;
+        K_s[2*WARP_SIZE + lane] = pk2; V_s[2*WARP_SIZE + lane] = pv2;
+        K_s[3*WARP_SIZE + lane] = pk3; V_s[3*WARP_SIZE + lane] = pv3;
+        if (ld4) {
+            K_s[4*WARP_SIZE + lane] = pk4; V_s[4*WARP_SIZE + lane] = pv4;
         }
         fattn_dq4_wave_sync();
+        if (t0 + gridDim.y*fattn_dq4_tile < k_VKQ_max) {
+            FATTN_DQ4_LOAD_TILE(row0 + gridDim.y*fattn_dq4_tile);
+        }
 
-        // S = Q K^T for the warp's R rows; S[p][h] is row p*4 + kr, replicated over the 8 lanes of the row.
-        float S[R/4][G];
+        // S = Q K^T for the warp's R rows. Each lane computes the partial dot products of its q4_0 block for all
+        // heads; a reduce-scatter over the 8 lanes of the row leaves the full score of head hs in each lane.
+        float S[R/4];
 #pragma unroll
         for (int p = 0; p < R/4; ++p) {
             const int rr  = p*4 + kr;
@@ -200,63 +255,84 @@ static __global__ void flash_attn_ext_decode_q4_0(
             for (int i = 0; i < 4; ++i) {
                 qs[i] = fattn_dq4_load_u32_a2(K_s32, off + 2 + 4*i);
             }
-            const float mval = __half2float(maskh[row0 + rr]);
+            float v[NB];
 #pragma unroll
-            for (int h = 0; h < G; ++h) {
-                int sumi = 0;
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    sumi = ggml_cuda_dp4a( qs[i]       & 0x0F0F0F0F, q_reg[h][i],     sumi);
-                    sumi = ggml_cuda_dp4a((qs[i] >> 4) & 0x0F0F0F0F, q_reg[h][i + 4], sumi);
+            for (int h = 0; h < NB; ++h) {
+                if (h >= G) {
+                    v[h] = 0.0f;
+                    continue;
                 }
-                float s = dK*(qd_reg[h].x*sumi - 8.0f*qd_reg[h].y);
-                s = warp_reduce_sum<NB>(s);
-                S[p][h] = s + mval;
+                const int4 qa = ((const int4 *) Q_qs[h][kb])[0];
+                const int4 qb = ((const int4 *) Q_qs[h][kb])[1];
+                const float2 qd = Q_ds[h][kb];
+                int sumi = 0;
+                sumi = ggml_cuda_dp4a( qs[0]       & 0x0F0F0F0F, qa.x, sumi);
+                sumi = ggml_cuda_dp4a( qs[1]       & 0x0F0F0F0F, qa.y, sumi);
+                sumi = ggml_cuda_dp4a( qs[2]       & 0x0F0F0F0F, qa.z, sumi);
+                sumi = ggml_cuda_dp4a( qs[3]       & 0x0F0F0F0F, qa.w, sumi);
+                sumi = ggml_cuda_dp4a((qs[0] >> 4) & 0x0F0F0F0F, qb.x, sumi);
+                sumi = ggml_cuda_dp4a((qs[1] >> 4) & 0x0F0F0F0F, qb.y, sumi);
+                sumi = ggml_cuda_dp4a((qs[2] >> 4) & 0x0F0F0F0F, qb.z, sumi);
+                sumi = ggml_cuda_dp4a((qs[3] >> 4) & 0x0F0F0F0F, qb.w, sumi);
+                v[h] = dK*(qd.x*sumi - 8.0f*qd.y);
             }
+            // Reduce-scatter: at each step a lane keeps half of its heads and adds the partner's copy of them.
+            const bool b4 = lane & 4;
+            float u4[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float keep = b4 ? v[i + 4] : v[i];
+                const float send = b4 ? v[i]     : v[i + 4];
+                u4[i] = keep + fattn_dq4_xor<4>(send);
+            }
+            const bool b2 = lane & 2;
+            float u2[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const float keep = b2 ? u4[i + 2] : u4[i];
+                const float send = b2 ? u4[i]     : u4[i + 2];
+                u2[i] = keep + fattn_dq4_xor<2>(send);
+            }
+            const bool b1 = lane & 1;
+            const float sc = (b1 ? u2[1] : u2[0]) + fattn_dq4_xor<1>(b1 ? u2[0] : u2[1]);
+            S[p] = sc + __half2float(maskh[row0 + rr])*1.4426950408889634f;
         }
 
-        // Online softmax over the tile.
+        // Online softmax over the tile, for head hs.
+        float tmax = S[0];
+#pragma unroll
+        for (int p = 1; p < R/4; ++p) {
+            tmax = fmaxf(tmax, S[p]);
+        }
+        tmax = fmaxf(tmax, fattn_dq4_xor<8>(tmax));
+        tmax = fmaxf(tmax, fattn_dq4_xor<16>(tmax));
+        const float m_new = fmaxf(KQ_max, tmax);
+        const float alpha = __builtin_amdgcn_exp2f(KQ_max - m_new);
+        KQ_max = m_new;
+        float tsum = 0.0f;
+#pragma unroll
+        for (int p = 0; p < R/4; ++p) {
+            S[p] = __builtin_amdgcn_exp2f(S[p] - m_new);
+            tsum += S[p];
+        }
+        tsum += fattn_dq4_xor<8>(tsum);
+        tsum += fattn_dq4_xor<16>(tsum);
+        KQ_sum = KQ_sum*alpha + tsum;
+        if (hs < G) {
+#pragma unroll
+            for (int p = 0; p < R/4; ++p) {
+                P_s[warp][p*4 + kr][hs] = S[p];
+            }
+        }
+        // Rescale the accumulators of every head with the alpha of lane h (which holds head h).
 #pragma unroll
         for (int h = 0; h < G; ++h) {
-            float tmax = S[0][h];
-#pragma unroll
-            for (int p = 1; p < R/4; ++p) {
-                tmax = fmaxf(tmax, S[p][h]);
-            }
-#pragma unroll
-            for (int offset = NB; offset < WARP_SIZE; offset <<= 1) {
-                tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFF, tmax, offset, WARP_SIZE));
-            }
-            const float m_new = fmaxf(KQ_max[h], tmax);
-            const float alpha = expf(KQ_max[h] - m_new);
-            KQ_max[h] = m_new;
-
-            float tsum = 0.0f;
-#pragma unroll
-            for (int p = 0; p < R/4; ++p) {
-                S[p][h] = expf(S[p][h] - m_new);
-                tsum += S[p][h];
-            }
-#pragma unroll
-            for (int offset = NB; offset < WARP_SIZE; offset <<= 1) {
-                tsum += __shfl_xor_sync(0xFFFFFFFF, tsum, offset, WARP_SIZE);
-            }
-            KQ_sum[h] = KQ_sum[h]*alpha + tsum;
-
+            const float alpha_h = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(alpha), h));
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                acc[h][i] *= alpha;
+                acc[h][i] *= alpha_h;
             }
-            csum[h] *= alpha;
-        }
-        if (kb == 0) {
-#pragma unroll
-            for (int p = 0; p < R/4; ++p) {
-#pragma unroll
-                for (int h = 0; h < G; ++h) {
-                    P_s[warp][p*4 + kr][h] = S[p][h];
-                }
-            }
+            csum[h] *= alpha_h;
         }
         fattn_dq4_wave_sync();
 
@@ -266,12 +342,12 @@ static __global__ void flash_attn_ext_decode_q4_0(
             const int off = rr*fattn_dq4_row_b + vb*int(sizeof(block_q4_0));
             const float dV = __half2float(__ushort_as_half((unsigned short) (fattn_dq4_load_u32_a2(V_s32, off) & 0xFFFF)));
             const uint32_t q = fattn_dq4_load_u32_a2(V_s32, off + 2 + 4*vj);
-            float vf[8];
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                vf[k]     = float((q >> (8*k))     & 0x0F);
-                vf[4 + k] = float((q >> (8*k + 4)) & 0x0F);
-            }
+            const uint32_t qlo =  q       & 0x0F0F0F0F;
+            const uint32_t qhi = (q >> 4) & 0x0F0F0F0F;
+            const float vf[8] = {
+                fattn_dq4_ubyte<0>(qlo), fattn_dq4_ubyte<1>(qlo), fattn_dq4_ubyte<2>(qlo), fattn_dq4_ubyte<3>(qlo),
+                fattn_dq4_ubyte<0>(qhi), fattn_dq4_ubyte<1>(qhi), fattn_dq4_ubyte<2>(qhi), fattn_dq4_ubyte<3>(qhi),
+            };
 #pragma unroll
             for (int h = 0; h < G; ++h) {
                 const float w = P_s[warp][rr][h]*dV;
@@ -284,12 +360,16 @@ static __global__ void flash_attn_ext_decode_q4_0(
         }
     }
 
-    // Merge the warps of the block.
-    if (lane == 0) {
-#pragma unroll
-        for (int h = 0; h < G; ++h) {
-            ml_s[warp][h] = make_float2(KQ_max[h], KQ_sum[h]);
-        }
+#undef FATTN_DQ4_LOAD_TILE
+#undef FATTN_DQ4_LD
+
+    // Merge the warps of the block. O_s aliases the staging buffers, so clear it once every warp is done with them.
+    __syncthreads();
+    for (int t = tid; t < G*D/4; t += nwarps*WARP_SIZE) {
+        ((float4 *) O_s)[t] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    if (lane < G) {
+        ml_s[warp][lane] = make_float2(KQ_max, KQ_sum);
     }
     __syncthreads();
     float M[G];
@@ -304,16 +384,25 @@ static __global__ void flash_attn_ext_decode_q4_0(
         L[h] = 0.0f;
 #pragma unroll
         for (int w = 0; w < nwarps; ++w) {
-            L[h] += ml_s[w][h].y*expf(ml_s[w][h].x - M[h]);
-        }
-        const float f = expf(KQ_max[h] - M[h]);
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            atomicAdd(&O_s[h][32*vb +      4*vj + k], (acc[h][k]     - 8.0f*csum[h])*f);
-            atomicAdd(&O_s[h][32*vb + 16 + 4*vj + k], (acc[h][4 + k] - 8.0f*csum[h])*f);
+            L[h] += ml_s[w][h].y*__builtin_amdgcn_exp2f(ml_s[w][h].x - M[h]);
         }
     }
-    __syncthreads();
+    // Add the warps' outputs in a fixed order, so that results are deterministic (float atomics are not).
+#pragma unroll
+    for (int w = 0; w < nwarps; ++w) {
+        if (warp == w) {
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float f = __builtin_amdgcn_exp2f(ml_s[warp][h].x - M[h]);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    O_s[h][32*vb +      4*vj + k] += (acc[h][k]     - 8.0f*csum[h])*f;
+                    O_s[h][32*vb + 16 + 4*vj + k] += (acc[h][4 + k] - 8.0f*csum[h])*f;
+                }
+            }
+        }
+        __syncthreads();
+    }
 
     for (int i = tid; i < G*D; i += nwarps*WARP_SIZE) {
         const int h   = i / D;
@@ -325,7 +414,7 @@ static __global__ void flash_attn_ext_decode_q4_0(
         dst[((int64_t(sequence)*int(ne01.z)*ne02 + head0 + h)*gridDim.y + blockIdx.y)*D + dim] = val;
     }
     if (gridDim.y != 1 && tid < G) {
-        dst_meta[(int64_t(sequence)*int(ne01.z)*ne02 + head0 + tid)*gridDim.y + blockIdx.y] = make_float2(M[tid], L[tid]);
+        dst_meta[(int64_t(sequence)*int(ne01.z)*ne02 + head0 + tid)*gridDim.y + blockIdx.y] = make_float2(M[tid]*0.6931471805599453f, L[tid]); // combine works in base e
     }
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,

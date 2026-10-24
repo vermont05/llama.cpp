@@ -1610,6 +1610,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    // Stacked matrix-vector products: up to two more matrices of the same type and row length that multiply the
+    // same src1, computed in the same launch (rows of the first matrix, then of these).
+    const ggml_tensor * stack_src0[2] = { nullptr, nullptr };
+    ggml_tensor       * stack_dst[2]  = { nullptr, nullptr };
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1618,6 +1622,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    const void * stack_x[2]     = { nullptr, nullptr };
+    float      * stack_dst[2]   = { nullptr, nullptr };
+    uint32_t     stack_row0[2]  = { 0, 0 }; // first row of segment s+1 in the launch
+    uint32_t     stack_nrows[2] = { 0, 0 };
 };
 
 struct ggml_cuda_kernel_launch_params {

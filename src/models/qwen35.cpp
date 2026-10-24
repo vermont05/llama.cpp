@@ -310,6 +310,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
     cb(Vcur, "Vcur", il);
 
+    // Keep the Q, K and V matmuls adjacent in the graph, so the backend can run them as one launch.
+    static const bool late_qkv = getenv("LLAMA_QWEN35_LATE_QKV") != nullptr; // A/B switch
+    if (!late_qkv) {
+        ggml_build_forward_expand(gf, Qcur_full);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+    }
+
     // Apply K normalization
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
@@ -384,11 +392,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    // Expand the qkv projection now, so that its input transform directly follows attn_norm in the graph and the
-    // backend can fuse rms_norm * weight -> sign flip -> FWHT into one kernel. Otherwise the conv-state gather
-    // (the first source of the concat below) lands in between.
+    // Expand the input projections now: their input transform then directly follows attn_norm in the graph, so the
+    // backend can fuse rms_norm * weight -> sign flip -> FWHT into one kernel (otherwise the conv-state gather, the
+    // first source of the concat below, lands in between), and the z and qkv matmuls are adjacent, so the backend
+    // can run them as one launch.
     static const bool late_qkv = getenv("LLAMA_QWEN35_LATE_QKV") != nullptr; // A/B switch
     if (!late_qkv) {
+        ggml_build_forward_expand(gf, z);
         ggml_build_forward_expand(gf, qkv_mixed);
     }
 

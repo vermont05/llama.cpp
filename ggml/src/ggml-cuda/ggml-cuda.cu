@@ -4208,6 +4208,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // 2-3 adjacent single-token MUL_MATs of the same quantized type and row length that share src1: one mmvq launch,
+    // so that the small ones (e.g. Qwen3.5 K/V and GDN z projections) do not each pay a launch and a tail.
+    // GGML_CUDA_NO_MMVQ_STACK=1 disables it.
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
+        static const bool stack_disabled = getenv("GGML_CUDA_NO_MMVQ_STACK") != nullptr;
+        auto stackable = [&](const ggml_tensor * mm) {
+            const ggml_tensor * x = mm->src[0];
+            const ggml_tensor * y = mm->src[1];
+            return mm->op == GGML_OP_MUL_MAT && y == node->src[1] && ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                ggml_is_quantized(x->type) && x->type == node->src[0]->type && x->ne[0] == node->src[0]->ne[0] &&
+                x->nb[1] == node->src[0]->nb[1] && x->ne[2] == 1 && x->ne[3] == 1 && x->ne[1] % 8 == 0 &&
+                y->ne[1] == 1 && y->ne[2] == 1 && y->ne[3] == 1 && ggml_is_contiguous(mm) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(mm);
+        };
+        if (!stack_disabled && stackable(node) && stackable(cgraph->nodes[i + 1])) {
+            const bool third = i + 2 < cgraph->n_nodes && stackable(cgraph->nodes[i + 2]);
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.stack_src0[0] = cgraph->nodes[i + 1]->src[0];
+            fusion_data.stack_dst[0]  = cgraph->nodes[i + 1];
+            if (third) {
+                fusion_data.stack_src0[1] = cgraph->nodes[i + 2]->src[0];
+                fusion_data.stack_dst[1]  = cgraph->nodes[i + 2];
+            }
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
+            return third ? 2 : 1;
+        }
+    }
+
     // rms_norm * weight -> sign flip -> FWHT-hint matmul: one kernel per Hadamard chunk
     if (node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes) {
         const ggml_op ops[]       = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };

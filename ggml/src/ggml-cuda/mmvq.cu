@@ -581,6 +581,7 @@ static __global__ void mul_mat_vec_q(
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+    uint32_t row_bound = stride_col_dst; // rows of the destination written by this block
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -593,9 +594,22 @@ static __global__ void mul_mat_vec_q(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+              int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+    if constexpr (has_fusion && ncols_dst == 1) {
+        // Stacked matrices: the blocks past the first matrix's rows work on the next ones.
+#pragma unroll
+        for (int s = 1; s >= 0; --s) {
+            if (fusion.stack_x[s] != nullptr && uint32_t(row0) >= fusion.stack_row0[s]) {
+                vx        = fusion.stack_x[s];
+                dst       = fusion.stack_dst[s];
+                row0     -= fusion.stack_row0[s];
+                row_bound = fusion.stack_nrows[s];
+                break;
+            }
+        }
+    }
 
     const uint32_t channel_dst = blockIdx.y;
 
@@ -648,7 +662,7 @@ static __global__ void mul_mat_vec_q(
         // 2. load only on threads that won't die after partial sum calculation
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
         if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
-            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < row_bound)) {
             if (use_bias) {
                 x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
 #pragma unroll
@@ -819,7 +833,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < row_bound)) {
                 float result = tmp[j][i];
                 if constexpr (has_fusion) {
                     if constexpr (type == GGML_TYPE_NVFP4) {
@@ -954,7 +968,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.stack_x[0] != nullptr;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1434,7 +1448,25 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.gate_scale = fusion->gate_scale->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+
+        uint32_t row_next = src0->ne[1];
+        for (int s = 0; s < 2; ++s) {
+            const ggml_tensor * x_s = fusion->stack_src0[s];
+            if (!x_s) {
+                break;
+            }
+            GGML_ASSERT(!ids && !fusion->x_bias && !fusion->gate && !fusion->gate_bias && !fusion->x_scale);
+            GGML_ASSERT(x_s->type == src0->type && x_s->ne[0] == src0->ne[0] && x_s->nb[1] == src0->nb[1]);
+            GGML_ASSERT(x_s->ne[2] == 1 && x_s->ne[3] == 1 && ggml_is_contiguous(fusion->stack_dst[s]));
+            fusion_local.stack_x[s]     = x_s->data;
+            fusion_local.stack_dst[s]   = (float *) fusion->stack_dst[s]->data;
+            fusion_local.stack_row0[s]  = row_next;
+            fusion_local.stack_nrows[s] = x_s->ne[1];
+            row_next += x_s->ne[1];
+        }
     }
+    const int64_t nrows_launch = fusion_local.stack_x[0] ?
+        int64_t(fusion_local.stack_row0[fusion_local.stack_x[1] ? 1 : 0]) + fusion_local.stack_nrows[fusion_local.stack_x[1] ? 1 : 0] : ne01;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -1484,7 +1516,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
-        ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+        nrows_launch,      ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }

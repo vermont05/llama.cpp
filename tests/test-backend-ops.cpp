@@ -4504,6 +4504,45 @@ struct test_rwkv_wkv7 : public test_case {
 };
 
 // GGML_OP_MUL_MAT
+// Several single-token matrix-vector products sharing one input, concatenated (exercises the stacked mmvq launch).
+struct test_mul_mat_stack : public test_case {
+    const ggml_type type_a;
+    const int64_t k;
+    const std::array<int64_t, 3> m; // rows of each matrix, 0 = absent
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_a, k, m);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_stack(ggml_type type_a = GGML_TYPE_Q4_0, int64_t k = 512, std::array<int64_t, 3> m = {64, 32, 0})
+        : type_a(type_a), k(k), m(m) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = nullptr;
+        ggml_tensor * mm[3] = { nullptr, nullptr, nullptr };
+        for (int i = 0; i < 3; ++i) {
+            if (m[i] == 0) {
+                continue;
+            }
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m[i]);
+            mm[i] = ggml_mul_mat(ctx, a, b);
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (mm[i]) {
+                out = out ? ggml_concat(ctx, out, mm[i], 0) : mm[i];
+            }
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -10070,6 +10109,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q1_0));
+    for (ggml_type t : {GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_mul_mat_stack(t, 5120, {6144, 10240, 0}));
+        test_cases.emplace_back(new test_mul_mat_stack(t, 5120, {12288, 1024, 1024}));
+        test_cases.emplace_back(new test_mul_mat_stack(t, 1024, {64, 8, 0}));
+    }
     // Single-token decode with GQA and a quantized cache (vec kernel with several Q heads per block on RDNA3):
     for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
         for (int nr2 : {2, 4, 6, 8}) {
