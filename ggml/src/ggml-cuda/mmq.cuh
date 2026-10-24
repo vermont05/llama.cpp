@@ -182,7 +182,14 @@ struct ggml_cuda_mmq_config {
         type(type), nthreads(nthreads), occupancy(occupancy), I(I), J(J), sram_layout(sram_layout), K_vram(K_vram), stream_k(stream_k), fallback(fallback) {}
 
     constexpr __device__ int rows_per_warp() const {
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+        // PQ2_0 (and PTQ1_0): two 16-row tiles per warp over half the columns, so each B tile read from shared
+        // memory feeds two WMMAs.
+        if ((type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0) && J % 32 == 0) {
+            return 32;
+        }
+        return 16;
+#elif defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         return 16;
 #else
         return J >= 48 && J % 16 == 0 ? 32 : 16;

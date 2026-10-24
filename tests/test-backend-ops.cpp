@@ -10345,6 +10345,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
     }
+    // ... and prompt-sized (MMQ) at the same shapes
+    for (ggml_type t : {GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0}) {
+        for (auto [m, k] : std::initializer_list<std::pair<int64_t, int64_t>>{{5120, 5120}, {12288, 5120}, {34816, 5120}, {5120, 17408}}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, 512, k, {1, 1}, {1, 1}));
+        }
+    }
     // Qwen3.5-27B full-attention decode: 24 Q heads, 4 K/V heads, head size 256.
     for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
         for (int kv : {4096, 16384, 40960}) {
