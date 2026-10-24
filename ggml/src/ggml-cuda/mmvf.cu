@@ -15,7 +15,19 @@ static __global__ void mul_mat_vec_f(
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-    const int row         = blockIdx.x;
+          int row         = blockIdx.x;
+    if constexpr (has_fusion && ncols_dst == 1 && !is_multi_token_id) {
+        // Stacked matrices: the blocks past the first matrix's rows work on the next ones.
+#pragma unroll
+        for (int s = 1; s >= 0; --s) {
+            if (fusion.stack_x[s] != nullptr && uint32_t(row) >= fusion.stack_row0[s]) {
+                x    = (const T *) fusion.stack_x[s];
+                dst  = fusion.stack_dst[s];
+                row -= fusion.stack_row0[s];
+                break;
+            }
+        }
+    }
     // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
     const int channel_dst = blockIdx.y;
     const int tid         = threadIdx.x;
@@ -389,7 +401,7 @@ static void mul_mat_vec_f_switch_fusion(
 
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr || fusion.stack_x[0] != nullptr;
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
@@ -444,7 +456,7 @@ void launch_mul_mat_vec_f_cuda(
         }
     }
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr || fusion.stack_x[0] != nullptr;
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
@@ -675,7 +687,25 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+
+        uint32_t row_next = src0->ne[1];
+        for (int s = 0; s < 2; ++s) {
+            const ggml_tensor * x_s = fusion->stack_src0[s];
+            if (!x_s) {
+                break;
+            }
+            GGML_ASSERT(!ids && !fusion->x_bias && !fusion->gate && !fusion->gate_bias);
+            GGML_ASSERT(x_s->type == src0->type && x_s->ne[0] == src0->ne[0] && x_s->nb[1] == src0->nb[1]);
+            GGML_ASSERT(x_s->ne[2] == 1 && x_s->ne[3] == 1 && ggml_is_contiguous(fusion->stack_dst[s]));
+            fusion_local.stack_x[s]     = x_s->data;
+            fusion_local.stack_dst[s]   = (float *) fusion->stack_dst[s]->data;
+            fusion_local.stack_row0[s]  = row_next;
+            fusion_local.stack_nrows[s] = x_s->ne[1];
+            row_next += x_s->ne[1];
+        }
     }
+    const int64_t nrows_launch = fusion_local.stack_x[0] ?
+        int64_t(fusion_local.stack_row0[fusion_local.stack_x[1] ? 1 : 0]) + fusion_local.stack_nrows[fusion_local.stack_x[1] ? 1 : 0] : ne01;
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = src1->nb[1] / ts_src1;
@@ -701,19 +731,19 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_launch, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_F16: {
             const half * src0_d = (const half *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_launch, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows_launch, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;

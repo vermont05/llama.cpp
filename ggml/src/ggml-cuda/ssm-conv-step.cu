@@ -16,7 +16,8 @@ static constexpr int conv_step_head = 128;
 static __global__ void ssm_conv_step_f32(
         const float * __restrict__ state_src, const int32_t * __restrict__ ids, const int64_t state_src_row,
         const float * __restrict__ x, const float * __restrict__ w, const int w_stride,
-        float * state_dst, float * __restrict__ silu_dst, float * __restrict__ l2_dst, const int n_l2, const float eps) {
+        float * state_dst, float * __restrict__ silu_dst, float * __restrict__ l2_dst, const int n_l2, const float eps,
+        const int ncols_l2) {
     const int tid = threadIdx.x;
     const int c   = blockIdx.x*conv_step_head + tid;
 
@@ -48,24 +49,22 @@ static __global__ void ssm_conv_step_f32(
     silu_dst[c] = y;
 
     if (blockIdx.x*conv_step_head < n_l2) {
+        // Same code shape as l2_norm_f32<WARP_SIZE> (one warp per row, runtime column loop), so the rounding matches.
         __shared__ float ys[conv_step_head];
-        __shared__ float scale_s;
         ys[tid] = y;
         __syncthreads();
         if (tid < WARP_SIZE) {
             float tmp = 0.0f;
-#pragma unroll
-            for (int col = tid; col < conv_step_head; col += WARP_SIZE) {
+            for (int col = tid; col < ncols_l2; col += WARP_SIZE) {
                 const float xi = ys[col];
                 tmp += xi * xi;
             }
-            tmp = warp_reduce_sum<WARP_SIZE>(tmp);
-            if (tid == 0) {
-                scale_s = rsqrtf(fmaxf(tmp, eps * eps));
+            tmp = block_reduce<block_reduce_method::SUM, WARP_SIZE>(tmp, (float *) nullptr);
+            const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+            for (int col = tid; col < ncols_l2; col += WARP_SIZE) {
+                l2_dst[blockIdx.x*conv_step_head + col] = scale * ys[col];
             }
         }
-        __syncthreads();
-        l2_dst[c] = scale_s * y;
     }
 }
 
@@ -81,6 +80,7 @@ static __global__ void conv_step_compare(const float * a, const float * b, const
 
 struct conv_step_check {
     const ggml_tensor * l2 = nullptr;
+    int l2_idx = -1;
     const float * real[3] = { nullptr, nullptr, nullptr };
     float * tmp[3] = { nullptr, nullptr, nullptr };
     int n[3] = { 0, 0, 0 };
@@ -90,7 +90,8 @@ static float * conv_step_scratch = nullptr;
 static unsigned int * conv_step_stats = nullptr; // [3 outputs][count, max]
 
 void ggml_cuda_conv_step_check_node(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
-    if (conv_step_pending.l2 && i > 0 && cgraph->nodes[i - 1] == conv_step_pending.l2) {
+    // The view nodes right after the L2_NORM never reach the fusion hook, so compare at the first node past it.
+    if (conv_step_pending.l2 && i > conv_step_pending.l2_idx) {
         for (int k = 0; k < 3; ++k) {
             conv_step_compare<<<(conv_step_pending.n[k] + 255)/256, 256, 0, ctx.stream()>>>(
                 conv_step_pending.tmp[k], conv_step_pending.real[k], conv_step_pending.n[k], conv_step_stats + 2*k);
@@ -218,19 +219,25 @@ int ggml_cuda_try_fuse_conv_step(ggml_backend_cuda_context & ctx, const ggml_cgr
             CUDA_CHECK(cudaMemset(conv_step_stats, 0, 6*sizeof(unsigned int)));
         }
         conv_step_pending.l2 = l2;
+        for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+            if (cgraph->nodes[k] == l2) {
+                conv_step_pending.l2_idx = k;
+                break;
+            }
+        }
         conv_step_pending.tmp[0] = conv_step_scratch;       conv_step_pending.real[0] = (const float *) upd->data;  conv_step_pending.n[0] = 3*C;
         conv_step_pending.tmp[1] = conv_step_scratch + 3*C; conv_step_pending.real[1] = (const float *) silu->data; conv_step_pending.n[1] = C;
         conv_step_pending.tmp[2] = conv_step_scratch + 4*C; conv_step_pending.real[2] = (const float *) l2->data;   conv_step_pending.n[2] = n_l2;
         ssm_conv_step_f32<<<C/conv_step_head, conv_step_head, 0, ctx.stream()>>>(
             (const float *) g->src[0]->data, (const int32_t *) g->src[1]->data, g->src[0]->nb[1]/sizeof(float),
             (const float *) x->data, (const float *) w->data, w->nb[1]/sizeof(float),
-            conv_step_pending.tmp[0], conv_step_pending.tmp[1], conv_step_pending.tmp[2], n_l2, eps);
+            conv_step_pending.tmp[0], conv_step_pending.tmp[1], conv_step_pending.tmp[2], n_l2, eps, conv_step_head);
         return 0; // the original ops run and are compared after the L2_NORM node
     }
     ssm_conv_step_f32<<<C/conv_step_head, conv_step_head, 0, ctx.stream()>>>(
         (const float *) g->src[0]->data, (const int32_t *) g->src[1]->data, g->src[0]->nb[1]/sizeof(float),
         (const float *) x->data, (const float *) w->data, w->nb[1]/sizeof(float),
-        (float *) upd->data, (float *) silu->data, (float *) l2->data, n_l2, eps);
+        (float *) upd->data, (float *) silu->data, (float *) l2->data, n_l2, eps, conv_step_head);
     CUDA_CHECK(cudaGetLastError());
 
     // Index of the L2_NORM node relative to i.

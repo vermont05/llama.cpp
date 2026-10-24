@@ -402,8 +402,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         ggml_build_forward_expand(gf, qkv_mixed);
     }
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * beta_mm = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * beta = ggml_reshape_4d(ctx0, beta_mm, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     ggml_tensor * beta_raw = beta;
@@ -412,6 +412,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    // Keep the beta and alpha matmuls adjacent in the graph, so the backend can run them as one launch.
+    static const bool late_ab = getenv("LLAMA_QWEN35_LATE_QKV") != nullptr; // A/B switch
+    if (!late_ab) {
+        ggml_build_forward_expand(gf, beta_mm);
+        ggml_build_forward_expand(gf, alpha);
+    }
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 

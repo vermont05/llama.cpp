@@ -4241,6 +4241,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 y->ne[1] == 1 && y->ne[2] == 1 && y->ne[3] == 1 && ggml_is_contiguous(mm) &&
                 ggml_cuda_should_fuse_mul_mat_vec_q(mm);
         };
+        // The same for small float (f32/f16/bf16) matrices on the mmvf path.
+        auto stackable_f = [&](const ggml_tensor * mm) {
+            const ggml_tensor * x = mm->src[0];
+            const ggml_tensor * y = mm->src[1];
+            return mm->op == GGML_OP_MUL_MAT && y == node->src[1] && ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_BF16) &&
+                x->type == node->src[0]->type && x->ne[0] == node->src[0]->ne[0] && x->nb[1] == node->src[0]->nb[1] &&
+                x->ne[2] == 1 && x->ne[3] == 1 && y->ne[1] == 1 && y->ne[2] == 1 && y->ne[3] == 1 && ggml_is_contiguous(mm) &&
+                ggml_cuda_should_fuse_mul_mat_vec_f(mm);
+        };
+        if (!stack_disabled && stackable_f(node) && stackable_f(cgraph->nodes[i + 1])) {
+            const bool third = i + 2 < cgraph->n_nodes && stackable_f(cgraph->nodes[i + 2]);
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.stack_src0[0] = cgraph->nodes[i + 1]->src[0];
+            fusion_data.stack_dst[0]  = cgraph->nodes[i + 1];
+            if (third) {
+                fusion_data.stack_src0[1] = cgraph->nodes[i + 2]->src[0];
+                fusion_data.stack_dst[1]  = cgraph->nodes[i + 2];
+            }
+            ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
+            return third ? 2 : 1;
+        }
         if (!stack_disabled && stackable(node) && stackable(cgraph->nodes[i + 1])) {
             const bool third = i + 2 < cgraph->n_nodes && stackable(cgraph->nodes[i + 2]);
             ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -4597,7 +4619,32 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
+                // Debug: GGML_CUDA_SUMS=<n> prints a checksum of every node's output in the n-th evaluated graph,
+                // right after it ran (fused groups: after the group).
+                static const int sums_at = getenv("GGML_CUDA_SUMS") ? atoi(getenv("GGML_CUDA_SUMS")) : -1;
+                auto print_sums = [&](int k0, int k1) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    for (int k = k0; k <= k1; ++k) {
+                        const ggml_tensor * t = cgraph->nodes[k];
+                        if (t->type != GGML_TYPE_F32 || ggml_nelements(t) == 0 || !ggml_is_contiguous(t) || ggml_nbytes(t) > (64 << 20)) {
+                            continue;
+                        }
+                        std::vector<float> h(ggml_nelements(t));
+                        CUDA_CHECK(cudaMemcpy(h.data(), t->data, ggml_nbytes(t), cudaMemcpyDeviceToHost));
+                        double sum = 0.0;
+                        uint32_t hash = 2166136261u;
+                        for (float v : h) {
+                            sum += v;
+                            uint32_t u; memcpy(&u, &v, 4); hash = (hash ^ u) * 16777619u;
+                        }
+                        GGML_LOG_INFO("sums %4d %-14s %-40s %.9g %08x\n", k, ggml_op_desc(t), t->name, sum, hash);
+                    }
+                };
+
                 if (nodes_to_skip != 0) {
+                    if (sums_at == n_graphs_evaluated - 1) {
+                        print_sums(i, i + nodes_to_skip);
+                    }
                     if (dump_graph) {
                         GGML_LOG_INFO("fused %4d..%4d: %s -> %s\n", i, i + nodes_to_skip, ggml_op_desc(node), ggml_op_desc(cgraph->nodes[i + nodes_to_skip]));
                     }
@@ -4677,6 +4724,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (sums_at == n_graphs_evaluated - 1) {
+                    print_sums(i, i);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

@@ -410,6 +410,10 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #ifndef PRISM_RDNA3_PQ2_0_ROWS
 #define PRISM_RDNA3_PQ2_0_ROWS 4
 #endif
+// Rows per block for the gate/up (GLU) fused kernel, which keeps twice the partial sums.
+#ifndef PRISM_RDNA3_PQ2_0_ROWS_GATE
+#define PRISM_RDNA3_PQ2_0_ROWS_GATE PRISM_RDNA3_PQ2_0_ROWS
+#endif
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
@@ -544,10 +548,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, ggml_type type = GGML_TYPE_COUNT) {
+static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, ggml_type type = GGML_TYPE_COUNT, bool has_gate = false) {
     // PQ2_0 weights are tiny next to q8_1 activations, so reuse each activation load for several rows.
     if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_PQ2_0 && ncols_dst == 1) {
-        return PRISM_RDNA3_PQ2_0_ROWS;
+        return has_gate ? PRISM_RDNA3_PQ2_0_ROWS_GATE : PRISM_RDNA3_PQ2_0_ROWS;
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -588,7 +592,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type, has_fusion && has_gate);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -948,9 +952,10 @@ static __global__ void mul_mat_vec_q_moe(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false,
+        const bool has_gate = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
+    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type, has_gate);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1142,7 +1147,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                                      nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+                                                                      nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters,
+                                                                      fusion.gate != nullptr);
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
