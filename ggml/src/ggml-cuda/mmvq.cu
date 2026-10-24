@@ -425,6 +425,18 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #ifndef PRISM_RDNA3_PTQ1_0_ROWS_GATE
 #define PRISM_RDNA3_PTQ1_0_ROWS_GATE PRISM_RDNA3_PTQ1_0_ROWS
 #endif
+// PQ2_0 / PTQ1_0 with 2..8 columns (speculative-decoding verify batches). The generic RDNA3 geometry (1 warp, 1 row)
+// made 2 columns cost twice 1; 4 rows per block: 4096x14336, 2/4/8 columns, PQ2_0 91/132/228 -> 67/90/151 us,
+// PTQ1_0 88/190/360 -> 65/99/222 us. PTQ1_0 also decodes each weight once for up to PRISM_PTQ1_0_MULTI_MAX columns.
+#ifndef PRISM_RDNA3_SMALLB_NWARPS
+#define PRISM_RDNA3_SMALLB_NWARPS 1
+#endif
+#ifndef PRISM_RDNA3_SMALLB_ROWS
+#define PRISM_RDNA3_SMALLB_ROWS 4
+#endif
+#ifndef PRISM_PTQ1_0_MULTI_MAX
+#define PRISM_PTQ1_0_MULTI_MAX 8
+#endif
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
@@ -504,6 +516,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 1;
             }
         }
+        if ((type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0) && ncols_dst <= 8) {
+            return PRISM_RDNA3_SMALLB_NWARPS;
+        }
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_TURING) {
@@ -568,6 +583,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_PTQ1_0 && ncols_dst == 1) {
         return has_gate ? PRISM_RDNA3_PTQ1_0_ROWS_GATE : PRISM_RDNA3_PTQ1_0_ROWS;
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && (type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_PTQ1_0) && ncols_dst <= 8) {
+        return PRISM_RDNA3_SMALLB_ROWS;
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -767,7 +785,7 @@ static __global__ void mul_mat_vec_q(
             // x block quant index when casting the quants to int
             const int kqs = vdr * (tid % (qi/vdr));
 
-        if constexpr (type == GGML_TYPE_PTQ1_0 && !ptq1_scalar && ncols_dst > 1 && ncols_dst <= 3) {
+        if constexpr (type == GGML_TYPE_PTQ1_0 && !ptq1_scalar && ncols_dst > 1 && ncols_dst <= PRISM_PTQ1_0_MULTI_MAX) {
 #    pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
