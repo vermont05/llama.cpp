@@ -10070,6 +10070,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q1_0));
+    // Single-token decode with GQA and a quantized cache (vec kernel with several Q heads per block on RDNA3):
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int nr2 : {2, 4, 6, 8}) {
+            for (int kv : {113, 512, 4096}) {
+                for (bool sinks : {false, true}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 1}, kv, 1, true, sinks, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
@@ -10276,6 +10287,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Qwen3.5-27B full-attention decode: 24 Q heads, 4 K/V heads, head size 256.
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int kv : {4096, 16384, 40960}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

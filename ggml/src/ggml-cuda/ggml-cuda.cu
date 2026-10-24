@@ -4431,6 +4431,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 cuda_ctx->gdn_rows_skip.clear();
             }
 
+            // Debug: GGML_CUDA_DUMP_GRAPH=<n> prints the nodes of the n-th evaluated graph and the fusions applied to it.
+            static const int dump_graph_at = getenv("GGML_CUDA_DUMP_GRAPH") ? atoi(getenv("GGML_CUDA_DUMP_GRAPH")) : -1;
+            static int n_graphs_evaluated = 0;
+            const bool dump_graph = n_graphs_evaluated++ == dump_graph_at;
+            if (dump_graph) {
+                for (int k = 0; k < cgraph->n_nodes; k++) {
+                    const ggml_tensor * t = cgraph->nodes[k];
+                    GGML_LOG_INFO("node %4d %-14s %-28s [%5lld,%5lld,%3lld,%2lld] %-5s <- %s, %s, %s\n", k, ggml_op_desc(t), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type),
+                        t->src[0] ? t->src[0]->name : "-", t->src[1] ? t->src[1]->name : "-", t->src[2] ? t->src[2]->name : "-");
+                }
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4538,6 +4551,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (dump_graph) {
+                        GGML_LOG_INFO("fused %4d..%4d: %s -> %s\n", i, i + nodes_to_skip, ggml_op_desc(node), ggml_op_desc(cgraph->nodes[i + nodes_to_skip]));
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4681,6 +4697,8 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static __global__ void ggml_cuda_timing_empty_kernel() {}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -4736,7 +4754,50 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    // Debug: GGML_CUDA_TIMING=1 reports, for graphs with > 1000 nodes, the host time spent in this call, the GPU time
+    // between events recorded at its start and end, and the host time between consecutive calls.
+    static const bool timing = getenv("GGML_CUDA_TIMING") != nullptr;
+    if (!timing || cgraph->n_nodes <= 1000) {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+        return GGML_STATUS_SUCCESS;
+    }
+    static cudaEvent_t ev[2] = { nullptr, nullptr };
+    static int64_t t_prev_enter = 0, t_prev_exit = 0;
+    static double acc_host = 0, acc_gpu = 0, acc_between = 0, acc_wall = 0;
+    static int n_acc = 0;
+    if (!ev[0]) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev[0], 0));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev[1], 0));
+    } else {
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ev[0], ev[1])); // previous graph, complete by now
+        acc_gpu += ms;
+    }
+    const int64_t t_enter = ggml_time_us();
+    if (t_prev_exit) {
+        acc_between += (t_enter - t_prev_exit) * 1e-3;
+        acc_wall    += (t_enter - t_prev_enter) * 1e-3;
+        n_acc++;
+    }
+    CUDA_CHECK(cudaEventRecord(ev[0], cuda_ctx->stream()));
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    // GGML_CUDA_TIMING_EXTRA=<n>: launch n empty kernels after the graph, to measure the cost of one more launch.
+    static const int n_extra = getenv("GGML_CUDA_TIMING_EXTRA") ? atoi(getenv("GGML_CUDA_TIMING_EXTRA")) : 0;
+    for (int k = 0; k < n_extra; ++k) {
+        ggml_cuda_timing_empty_kernel<<<1, 32, 0, cuda_ctx->stream()>>>();
+    }
+    CUDA_CHECK(cudaEventRecord(ev[1], cuda_ctx->stream()));
+    const int64_t t_exit = ggml_time_us();
+    acc_host += (t_exit - t_enter) * 1e-3;
+    t_prev_enter = t_enter;
+    t_prev_exit  = t_exit;
+    if (n_acc == 32) {
+        GGML_LOG_INFO("cuda timing (%d nodes): wall %.3f ms/graph, host in compute %.3f, host between computes %.3f, GPU start->end %.3f\n",
+            cgraph->n_nodes, acc_wall/n_acc, acc_host/(n_acc + 1), acc_between/n_acc, acc_gpu/n_acc);
+        acc_host = acc_gpu = acc_between = acc_wall = 0;
+        n_acc = 0;
+        t_prev_exit = 0;
+    }
 
     return GGML_STATUS_SUCCESS;
 }

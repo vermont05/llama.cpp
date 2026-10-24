@@ -384,6 +384,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    // Expand the qkv projection now, so that its input transform directly follows attn_norm in the graph and the
+    // backend can fuse rms_norm * weight -> sign flip -> FWHT into one kernel. Otherwise the conv-state gather
+    // (the first source of the concat below) lands in between.
+    static const bool late_qkv = getenv("LLAMA_QWEN35_LATE_QKV") != nullptr; // A/B switch
+    if (!late_qkv) {
+        ggml_build_forward_expand(gf, qkv_mixed);
+    }
+
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);

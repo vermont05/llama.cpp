@@ -1149,6 +1149,12 @@ void launch_fattn(
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
+        // Experiment hook: GGML_CUDA_FA_PARALLEL_BLOCKS=<n> overrides the occupancy-based start value.
+        static const int parallel_blocks_env = getenv("GGML_CUDA_FA_PARALLEL_BLOCKS") ? atoi(getenv("GGML_CUDA_FA_PARALLEL_BLOCKS")) : 0;
+        if (parallel_blocks_env > 0) {
+            parallel_blocks = parallel_blocks_env;
+        }
+
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
