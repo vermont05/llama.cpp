@@ -315,6 +315,16 @@ __global__ void fwht_rms_norm_block(const float * x, const float * w, float * no
     norm_dst += row * ncols;
 
     ggml_cuda_pdl_sync();
+    // This chunk's inputs do not depend on the norm: load them first so their latency overlaps the reduction.
+    const float * signs_row = signs + (r % n_blk) * N;
+    float xr[NE], wr[NE], sr[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const int col = chunk * N + i * NT + tid;
+        xr[i] = x[col];
+        wr[i] = w[col];
+        sr[i] = signs_row[i * NT + tid];
+    }
     // Sum in the same order as rms_norm_f32, which runs vt = 256 or 1024 threads: thread tid acts as the
     // virtual threads tid + k*NT, and each warp of them gives the same warp sum as there.
     const int vt = ncols < 1024 ? 256 : 1024;
@@ -336,15 +346,13 @@ __global__ void fwht_rms_norm_block(const float * x, const float * w, float * no
     const float sum    = WARP_SIZE == 32 ? fwht_warp_sum(sum_in) : warp_reduce_sum(sum_in);
     const float rscale = rsqrtf(sum / ncols + eps);
 
-    const float * signs_row = signs + (r % n_blk) * N;
-
     float reg[NE];
 #pragma unroll
     for (int i = 0; i < NE; ++i) {
         const int   col = chunk * N + i * NT + tid;
-        const float y   = rscale * x[col] * w[col];
+        const float y   = rscale * xr[i] * wr[i];
         norm_dst[col] = y;
-        reg[i] = y * scale * signs_row[i * NT + tid];
+        reg[i] = y * scale * sr[i];
     }
 
     fwht_block_finish<N, NT>(reg, s, r, dst, q8);
