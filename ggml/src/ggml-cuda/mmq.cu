@@ -201,12 +201,19 @@ void ggml_cuda_mul_mat_q(
     // PTQ1_0 prompt batches: repack the weights to PQ2_0 once and run the PQ2_0 kernel. The PTQ1_0 tile loader redoes
     // its base-3 decode for every column tile, the PQ2_0 one is a byte lookup; the result is the same.
     // GGML_CUDA_PTQ1_0_REPACK_MIN=<n> sets the smallest batch that repacks (default 0: always).
+    // GGML_CUDA_PTQ1_0_REPACK_MAX_MB=<n> (default 64): larger matrices, i.e. the 248k-row output head when every token
+    // needs logits (338 MB as PQ2_0), keep the PTQ1_0 loader instead of a copy the pool would then hold on to.
     static const int64_t ptq1_repack_min = [] {
         const char * s = getenv("GGML_CUDA_PTQ1_0_REPACK_MIN");
         return s ? (int64_t) atoll(s) : (int64_t) 0;
     }();
+    static const size_t ptq1_repack_max = [] {
+        const char * s = getenv("GGML_CUDA_PTQ1_0_REPACK_MAX_MB");
+        return (s ? (size_t) atoll(s) : (size_t) 64) << 20;
+    }();
     ggml_cuda_pool_alloc<char> src0_pq2_0(ctx.pool());
-    if (src0->type == GGML_TYPE_PTQ1_0 && !ids && ne11 >= ptq1_repack_min && ggml_is_contiguous(src0)) {
+    if (src0->type == GGML_TYPE_PTQ1_0 && !ids && ne11 >= ptq1_repack_min && ggml_is_contiguous(src0) &&
+            (size_t) (ggml_nelements(src0) / QK_PTQ1_0) * sizeof(block_pq2_0) <= ptq1_repack_max) {
         const int64_t nblocks = ggml_nelements(src0) / QK_PTQ1_0;
         src0_pq2_0.alloc(nblocks*sizeof(block_pq2_0));
         ptq1_0_to_pq2_0<<<(nblocks + ptq1_0_repack_blocks - 1) / ptq1_0_repack_blocks, ptq1_0_repack_threads, 0, stream>>>(
