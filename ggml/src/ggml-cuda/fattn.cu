@@ -513,7 +513,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
+    // Head size 256 (K and V) goes there too; the tile kernel it replaces ran at a fraction of the WMMA rate
+    // (Qwen3.5 prompt at 12k context: 241 -> 257 t/s on gfx1102). GGML_CUDA_FA_WMMA_256=0 restores the tile kernel.
+    static const bool wmma_256 = getenv("GGML_CUDA_FA_WMMA_256") == nullptr || atoi(getenv("GGML_CUDA_FA_WMMA_256")) != 0;
+    const bool wmma_head = Q->ne[0] <= 128 || (wmma_256 && Q->ne[0] == 256 && V->ne[0] == 256);
+    if ((amd_wmma_available(cc) && gqa_opt_applies && wmma_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
