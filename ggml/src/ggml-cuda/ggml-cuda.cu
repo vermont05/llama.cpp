@@ -2607,6 +2607,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+        // GGML_CUDA_GRAPHS_DECODE_ONLY=1: graphs only for single-token graphs. Batches whose shape changes from step
+        // to step (speculative verification) would be re-captured every time, which costs more than graphs save.
+        static const bool decode_only = getenv("GGML_CUDA_GRAPHS_DECODE_ONLY") != nullptr;
+        if (decode_only) {
+            const bool multi_token =
+                (node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD && node->src[1]->ne[1] > 1) ||
+                (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0]->ne[1] > 1);
+            if (multi_token) {
+                use_cuda_graph = false;
+                break;
+            }
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
