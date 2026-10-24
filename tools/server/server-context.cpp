@@ -784,6 +784,8 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
+static int64_t g_srv_t_sample_us = 0; // LLAMA_SERVER_TIMING
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -3562,12 +3564,32 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // Debug: LLAMA_SERVER_TIMING=1 reports the host time between the end of one decode (GPU done) and the
+        // launch of the next one, i.e. the time the GPU waits for the server.
+        static const bool srv_timing = getenv("LLAMA_SERVER_TIMING") != nullptr;
+        static int64_t t_gpu_done = 0;
+        static double  acc_gap = 0.0, acc_sampl = 0.0;
+        static int     n_gap = 0;
+        static double  t_sampl_prev = 0.0;
+        if (srv_timing && t_gpu_done != 0) {
+            acc_gap += (ggml_time_us() - t_gpu_done) * 1e-3;
+            if (++n_gap == 64) {
+                SRV_INF("server timing: %.3f ms/token between decodes (sample+accept %.3f ms/token)\n", acc_gap/n_gap, (g_srv_t_sample_us - t_sampl_prev)*1e-3/n_gap);
+                t_sampl_prev = g_srv_t_sample_us;
+                acc_gap = 0.0;
+                n_gap = 0;
+            }
+        }
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (srv_timing) {
+            t_gpu_done = has_output ? ggml_time_us() : 0;
+        }
+        GGML_UNUSED(acc_sampl);
 
         if (ret != 0) {
             {
@@ -3735,6 +3757,7 @@ private:
             const int tok_idx = slot.i_batch - off;
 
             llama_token id;
+            const int64_t t_smp0 = ggml_time_us();
             {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
@@ -3743,6 +3766,7 @@ private:
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
+            g_srv_t_sample_us += ggml_time_us() - t_smp0;
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();

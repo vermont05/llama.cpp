@@ -604,7 +604,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
+    // Debug: COMMON_SAMPLER_TIMING=1 reports where the per-token sampling time goes.
+    static const bool smp_timing = getenv("COMMON_SAMPLER_TIMING") != nullptr;
+    static int64_t acc_logits = 0, acc_rbudget = 0, acc_chain = 0;
+    static int     n_smp = 0;
+    const int64_t  t_s0 = smp_timing ? ggml_time_us() : 0;
+
     gsmpl->set_logits(ctx, idx);
+    const int64_t  t_s1 = smp_timing ? ggml_time_us() : 0;
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -630,6 +637,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
+    const int64_t t_s2 = smp_timing ? ggml_time_us() : 0;
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
         llama_sampler_apply(grmr, &cur_p);
@@ -638,6 +646,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
+    if (smp_timing) {
+        const int64_t t_s3 = ggml_time_us();
+        acc_logits += t_s1 - t_s0; acc_rbudget += t_s2 - t_s1; acc_chain += t_s3 - t_s2;
+        if (++n_smp == 64) {
+            LOG_INF("sampler timing: set_logits %.3f ms, reasoning budget %.3f ms, chain %.3f ms per token (n_vocab cur_p %zu)\n",
+                acc_logits*1e-3/n_smp, acc_rbudget*1e-3/n_smp, acc_chain*1e-3/n_smp, (size_t) cur_p.size);
+            acc_logits = acc_rbudget = acc_chain = 0;
+            n_smp = 0;
+        }
+    }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
