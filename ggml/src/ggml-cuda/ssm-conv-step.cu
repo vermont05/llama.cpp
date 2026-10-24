@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "unary.cuh"
+#include "convert.cuh"
 #include "ssm-conv-step.cuh"
 
 // Single-token decode of the gated delta net input convolution as one kernel. The graph does
@@ -13,12 +14,70 @@
 
 static constexpr int conv_step_head = 128;
 
+// Optional second role (the GDN beta and alpha projections, two small bf16 matvecs with the same input): the blocks
+// past the conv blocks compute one row each with the arithmetic of mul_mat_vec_f<nv_bfloat16, float, 1, 256> on
+// HIP. That kernel runs 256 threads per row; here each of the 128 threads plays virtual threads tid and tid + 128,
+// with the same per-thread FMA sequence and the same warp-reduction pairing, so the result is bit-identical.
+struct conv_step_ab_args {
+    const int   * x[2]     = { nullptr, nullptr }; // bf16 pairs
+    float       * dst[2]   = { nullptr, nullptr };
+    int           rows[2]  = { 0, 0 };
+    int           stride2  = 0;                     // row stride in bf16 pairs
+    int           ncols2   = 0;
+    const float * y        = nullptr;
+};
+
+static __device__ __forceinline__ void conv_step_ab_row(const conv_step_ab_args & ab, const int row_all) {
+    constexpr int block_size = 256;
+    const int tid  = threadIdx.x;
+    const bool second = row_all >= ab.rows[0];
+    const int  row    = second ? row_all - ab.rows[0] : row_all;
+    const int   * x2 = (second ? ab.x[1] : ab.x[0]) + int64_t(row)*ab.stride2;
+    float       * dst = second ? ab.dst[1] : ab.dst[0];
+    const float2 * y2 = (const float2 *) ab.y;
+
+    float sumf[2] = { 0.0f, 0.0f };
+#pragma unroll
+    for (int v = 0; v < 2; ++v) {
+        for (int col2 = tid + v*128; col2 < ab.ncols2; col2 += block_size) {
+            const int tmpx = x2[col2];
+            const float2 tmpy = y2[col2];
+            const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
+            const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
+            ggml_cuda_mad(sumf[v], tmpx0, tmpy.x);
+            ggml_cuda_mad(sumf[v], tmpx1, tmpy.y);
+        }
+        sumf[v] = warp_reduce_sum<WARP_SIZE>(sumf[v]);
+    }
+    __shared__ float buf_iw[WARP_SIZE];
+    if (tid < WARP_SIZE) {
+        buf_iw[tid] = 0.0f;
+    }
+    __syncthreads();
+    if (tid % WARP_SIZE == 0) {
+        buf_iw[tid/WARP_SIZE]     = sumf[0]; // virtual warps 0..3
+        buf_iw[tid/WARP_SIZE + 4] = sumf[1]; // virtual warps 4..7
+    }
+    __syncthreads();
+    if (tid < WARP_SIZE) {
+        float value = buf_iw[tid];
+        value = warp_reduce_sum<WARP_SIZE>(value);
+        if (tid == 0) {
+            dst[row] = value;
+        }
+    }
+}
+
 static __global__ void ssm_conv_step_f32(
         const float * __restrict__ state_src, const int32_t * __restrict__ ids, const int64_t state_src_row,
         const float * __restrict__ x, const float * __restrict__ w, const int w_stride,
         float * state_dst, float * __restrict__ silu_dst, float * __restrict__ l2_dst, const int n_l2, const float eps,
-        const int ncols_l2) {
+        const int ncols_l2, const int n_conv_blocks, const conv_step_ab_args ab) {
     const int tid = threadIdx.x;
+    if ((int) blockIdx.x >= n_conv_blocks) {
+        conv_step_ab_row(ab, blockIdx.x - n_conv_blocks);
+        return;
+    }
     const int c   = blockIdx.x*conv_step_head + tid;
 
     const float * s = state_src + int64_t(ids[0])*state_src_row + 3*c;
@@ -210,6 +269,60 @@ int ggml_cuda_try_fuse_conv_step(ggml_backend_cuda_context & ctx, const ggml_cgr
     float eps;
     memcpy(&eps, l2->op_params, sizeof(float));
 
+    // Absorb the two bf16 matvecs that follow (the GDN beta/alpha projections), if they match.
+    static const bool ab_disabled = getenv("GGML_CUDA_NO_CONV_STEP_AB") != nullptr;
+    int l2_idx = -1;
+    for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+        if (cgraph->nodes[k] == l2) {
+            l2_idx = k;
+            break;
+        }
+    }
+    conv_step_ab_args ab;
+    int last_idx = l2_idx;
+    if (!ab_disabled && l2_idx >= 0 && l2_idx + 2 < cgraph->n_nodes) {
+        const ggml_tensor * m0 = cgraph->nodes[l2_idx + 1];
+        const ggml_tensor * m1 = cgraph->nodes[l2_idx + 2];
+        auto ok_mm = [&](const ggml_tensor * m) {
+            const ggml_tensor * a = m->src[0];
+            const ggml_tensor * y = m->src[1];
+            return m->op == GGML_OP_MUL_MAT && a->type == GGML_TYPE_BF16 && y->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 &&
+                ggml_get_op_params_i32(m, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                a->ne[2] == 1 && a->ne[3] == 1 && a->ne[0] % 2 == 0 && a->nb[0] == 2 && a->nb[1] % 4 == 0 &&
+                y->ne[0] == a->ne[0] && y->ne[1] == 1 && y->ne[2] == 1 && y->ne[3] == 1 && ggml_is_contiguous(y) &&
+                ggml_is_contiguous(m) && m->ne[0] == a->ne[1] && m->src[2] == nullptr;
+        };
+        if (ok_mm(m0) && ok_mm(m1) && m0->src[1] == m1->src[1] && m0->src[0]->ne[0] == m1->src[0]->ne[0] &&
+                m0->src[0]->nb[1] == m1->src[0]->nb[1]) {
+            // no output may overlap any input of the whole fused group
+            bool clash = false;
+            for (const ggml_tensor * o : {m0, m1}) {
+                for (const ggml_tensor * in : {x, w, (const ggml_tensor *) g->src[0], (const ggml_tensor *) g->src[1],
+                        (const ggml_tensor *) m0->src[1], (const ggml_tensor *) m0->src[0], (const ggml_tensor *) m1->src[0]}) {
+                    clash = clash || overlaps(o, in);
+                }
+                for (const ggml_tensor * oo : {silu, l2, upd}) {
+                    clash = clash || overlaps(o, oo);
+                }
+            }
+            clash = clash || overlaps(m0, m1) || overlaps(silu, m0->src[1]) || overlaps(l2, m0->src[1]) || overlaps(upd, m0->src[1]);
+            if (!clash) {
+                ab.x[0]    = (const int *) m0->src[0]->data;
+                ab.x[1]    = (const int *) m1->src[0]->data;
+                ab.dst[0]  = (float *) m0->data;
+                ab.dst[1]  = (float *) m1->data;
+                ab.rows[0] = m0->src[0]->ne[1];
+                ab.rows[1] = m1->src[0]->ne[1];
+                ab.stride2 = m0->src[0]->nb[1] / 4;
+                ab.ncols2  = m0->src[0]->ne[0] / 2;
+                ab.y       = (const float *) m0->src[1]->data;
+                last_idx   = l2_idx + 2;
+            }
+        }
+    }
+    const int n_conv_blocks = C/conv_step_head;
+    const int n_ab_blocks   = ab.rows[0] + ab.rows[1];
+
     const int n_l2 = vqk->ne[1]*conv_step_head;
     static const bool check = getenv("GGML_CUDA_CONV_STEP_CHECK") != nullptr;
     if (check) {
@@ -228,25 +341,18 @@ int ggml_cuda_try_fuse_conv_step(ggml_backend_cuda_context & ctx, const ggml_cgr
         conv_step_pending.tmp[0] = conv_step_scratch;       conv_step_pending.real[0] = (const float *) upd->data;  conv_step_pending.n[0] = 3*C;
         conv_step_pending.tmp[1] = conv_step_scratch + 3*C; conv_step_pending.real[1] = (const float *) silu->data; conv_step_pending.n[1] = C;
         conv_step_pending.tmp[2] = conv_step_scratch + 4*C; conv_step_pending.real[2] = (const float *) l2->data;   conv_step_pending.n[2] = n_l2;
-        ssm_conv_step_f32<<<C/conv_step_head, conv_step_head, 0, ctx.stream()>>>(
+        ssm_conv_step_f32<<<n_conv_blocks, conv_step_head, 0, ctx.stream()>>>(
             (const float *) g->src[0]->data, (const int32_t *) g->src[1]->data, g->src[0]->nb[1]/sizeof(float),
             (const float *) x->data, (const float *) w->data, w->nb[1]/sizeof(float),
-            conv_step_pending.tmp[0], conv_step_pending.tmp[1], conv_step_pending.tmp[2], n_l2, eps, conv_step_head);
+            conv_step_pending.tmp[0], conv_step_pending.tmp[1], conv_step_pending.tmp[2], n_l2, eps, conv_step_head,
+            n_conv_blocks, conv_step_ab_args{});
         return 0; // the original ops run and are compared after the L2_NORM node
     }
-    ssm_conv_step_f32<<<C/conv_step_head, conv_step_head, 0, ctx.stream()>>>(
+    ssm_conv_step_f32<<<n_conv_blocks + n_ab_blocks, conv_step_head, 0, ctx.stream()>>>(
         (const float *) g->src[0]->data, (const int32_t *) g->src[1]->data, g->src[0]->nb[1]/sizeof(float),
         (const float *) x->data, (const float *) w->data, w->nb[1]/sizeof(float),
-        (float *) upd->data, (float *) silu->data, (float *) l2->data, n_l2, eps, conv_step_head);
+        (float *) upd->data, (float *) silu->data, (float *) l2->data, n_l2, eps, conv_step_head, n_conv_blocks, ab);
     CUDA_CHECK(cudaGetLastError());
 
-    // Index of the L2_NORM node relative to i.
-    int last_idx = i;
-    for (int k = i + 1; k < cgraph->n_nodes; ++k) {
-        if (cgraph->nodes[k] == l2) {
-            last_idx = k;
-            break;
-        }
-    }
     return last_idx - i;
 }

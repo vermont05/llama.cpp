@@ -412,12 +412,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    // Keep the beta and alpha matmuls adjacent in the graph, so the backend can run them as one launch.
-    static const bool late_ab = getenv("LLAMA_QWEN35_LATE_QKV") != nullptr; // A/B switch
-    if (!late_ab) {
-        ggml_build_forward_expand(gf, beta_mm);
-        ggml_build_forward_expand(gf, alpha);
-    }
+    // The beta and alpha matmuls are emitted adjacently right after the conv chain below, so the backend can run
+    // them in the same launch as the conv step.
+    ggml_tensor * alpha_mm = alpha;
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -508,6 +505,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     if (!late_conv) {
         ggml_build_forward_expand(gf, qk_conv);
         ggml_build_forward_expand(gf, conv_output_silu);
+        ggml_build_forward_expand(gf, beta_mm);
+        ggml_build_forward_expand(gf, alpha_mm);
     }
 
     // ring path: read per-seq live state directly from the cache inside the
