@@ -449,27 +449,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    // ring path: read per-seq live state directly from the cache inside the
-    // fused GDN op (rows mode) instead of a gather per layer.
-    // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B).
-    // rows mode (the src[6] variant) is implemented on CPU and Metal only;
-    // other GPU backends reject it in supports_op, which would silently move
-    // the whole recurrent op to CPU -- keep the gathered form unless every
-    // GPU device in the model is Metal.
-    static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
-
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
-
-    ggml_tensor * state;
-    if (gdn_state_rows) {
-        state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-        cb(state, "state_cache_view", il);
-    } else {
-        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-        cb(state, "state_predelta", il);
-    }
-
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
@@ -516,6 +495,36 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
             0);
     qk_conv = ggml_l2_norm(ctx0, qk_conv, eps_norm);
     cb(qk_conv, "qk_conv_l2", il);
+
+    // Emit the conv chain (state gather, concat, state update, conv + silu, l2 norm) before the recurrent state
+    // gather, so its nodes are contiguous in the graph and the backend can run it as one kernel.
+    static const bool late_conv = getenv("LLAMA_QWEN35_LATE_QKV") != nullptr; // A/B switch
+    if (!late_conv) {
+        ggml_build_forward_expand(gf, qk_conv);
+        ggml_build_forward_expand(gf, conv_output_silu);
+    }
+
+    // ring path: read per-seq live state directly from the cache inside the
+    // fused GDN op (rows mode) instead of a gather per layer.
+    // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B).
+    // rows mode (the src[6] variant) is implemented on CPU and Metal only;
+    // other GPU backends reject it in supports_op, which would silently move
+    // the whole recurrent op to CPU -- keep the gathered form unless every
+    // GPU device in the model is Metal.
+    static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
+
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
+
+    ggml_tensor * state;
+    if (gdn_state_rows) {
+        state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        cb(state, "state_cache_view", il);
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
+
 
     q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
             qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], 0);

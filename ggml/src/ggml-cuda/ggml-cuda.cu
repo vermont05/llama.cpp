@@ -26,6 +26,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
+#include "ggml-cuda/ssm-conv-step.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -4208,6 +4209,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    static const bool conv_step_check = getenv("GGML_CUDA_CONV_STEP_CHECK") != nullptr;
+    if (conv_step_check) {
+        ggml_cuda_conv_step_check_node(*cuda_ctx, cgraph, i);
+    }
+    if (node->op == GGML_OP_GET_ROWS) {
+        const int n_conv = ggml_cuda_try_fuse_conv_step(*cuda_ctx, cgraph, i);
+        if (n_conv > 0) {
+            return n_conv;
+        }
+    }
+
     // 2-3 adjacent single-token MUL_MATs of the same quantized type and row length that share src1: one mmvq launch,
     // so that the small ones (e.g. Qwen3.5 K/V and GDN z projections) do not each pay a launch and a tail.
     // GGML_CUDA_NO_MMVQ_STACK=1 disables it.
@@ -4787,6 +4799,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     static const bool timing = getenv("GGML_CUDA_TIMING") != nullptr;
     if (!timing || cgraph->n_nodes <= 1000) {
         ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+        static const bool conv_step_check = getenv("GGML_CUDA_CONV_STEP_CHECK") != nullptr;
+        if (conv_step_check && cgraph->n_nodes > 1000) {
+            ggml_cuda_conv_step_check_report(*cuda_ctx);
+        }
         return GGML_STATUS_SUCCESS;
     }
     static cudaEvent_t ev[2] = { nullptr, nullptr };
