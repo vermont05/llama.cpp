@@ -4218,6 +4218,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (conv_step_check) {
         ggml_cuda_conv_step_check_node(*cuda_ctx, cgraph, i);
     }
+    if (node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * un  = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        if (un->op == GGML_OP_UNARY && ggml_get_unary_op(un) == GGML_UNARY_OP_SIGMOID && un->src[0] == node &&
+                mul->op == GGML_OP_MUL && (mul->src[0] == un || mul->src[1] == un) &&
+                ggml_cuda_op_cont_sigmoid_mul(*cuda_ctx, node, un, mul)) {
+            return 2;
+        }
+    }
+    if (node->op == GGML_OP_SET_ROWS && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * mid = cgraph->nodes[i + 1];
+        ggml_tensor * b   = cgraph->nodes[i + 2];
+        if ((mid->op == GGML_OP_VIEW || mid->op == GGML_OP_RESHAPE) && b->op == GGML_OP_SET_ROWS && b->src[0] == mid &&
+                ggml_cuda_op_set_rows_q4_0_pair(*cuda_ctx, node, b)) {
+            return 2;
+        }
+    }
     if (node->op == GGML_OP_RMS_NORM) {
         const int n_gn = ggml_cuda_try_fuse_gated_norm(*cuda_ctx, cgraph, i);
         if (n_gn > 0) {
@@ -4297,6 +4314,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_can_fuse_subgraph(cgraph, i, 5, ops, out_nodes, 2) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 2) &&
                 ggml_cuda_op_rms_norm_fwht(*cuda_ctx, node, mul, mul_s->src[1], mm)) {
+            return 4;
+        }
+    }
+
+    // rms_norm * w -> rope -> reshape -> FWHT-hint matmul (N = 256, the Qwen3.5 Q/K rotation) as one kernel
+    if (node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes && getenv("GGML_CUDA_NO_ROPE_FWHT") == nullptr) {
+        const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+        const int out_nodes[] = { i + 4 };
+        ggml_tensor * mul  = cgraph->nodes[i + 1];
+        ggml_tensor * rope = cgraph->nodes[i + 2];
+        ggml_tensor * resh = cgraph->nodes[i + 3];
+        ggml_tensor * mm   = cgraph->nodes[i + 4];
+        if (mul->op == GGML_OP_MUL && rope->op == GGML_OP_ROPE && resh->op == GGML_OP_RESHAPE && mm->op == GGML_OP_MUL_MAT &&
+                ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[1] == resh && resh->src[0] == rope &&
+                rope->ne[0] == 256 && mm->ne[0] == 256 && node->src[0]->ne[0] == 256 && ggml_nelements(mm) == ggml_nelements(rope) &&
+                mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) && ggml_is_contiguous(rope) &&
+                ggml_cuda_should_fuse_rms_norm_mul_rope(node, mul, rope) &&
+                ggml_can_fuse_subgraph(cgraph, i, 5, ops, out_nodes, 1)) {
+            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, mul, rope, nullptr, mm);
             return 4;
         }
     }

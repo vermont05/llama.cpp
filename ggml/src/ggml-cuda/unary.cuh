@@ -112,3 +112,6 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
     out_glu = out_glu * (1.0f + g);
     return out_glu;
 }
+
+// CONT(strided 2D view) -> SIGMOID -> MUL as one kernel; false if not applicable.
+bool ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * unary_node, ggml_tensor * mul_node);

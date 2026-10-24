@@ -396,3 +396,57 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
     }
 }
+
+// Two single-row SET_ROWS into Q4_0 caches (the K and V cache writes of one attention layer) as one launch.
+// Each thread quantizes one 32-value block with quantize_f32_q4_0_block, as k_set_rows_quant does.
+// GGML_CUDA_NO_SET_ROWS_PAIR=1 disables it.
+template <typename idx_t>
+static __global__ void k_set_rows_q4_0_pair(
+        const float * __restrict__ x0, const idx_t * __restrict__ idx0, char * __restrict__ dst0, const int64_t nb01, const int nblk0,
+        const float * __restrict__ x1, const idx_t * __restrict__ idx1, char * __restrict__ dst1, const int64_t nb11, const int nblk1) {
+    // One code path for both tensors (pick the pointers first): with a branch per tensor the compiler contracted
+    // x*id + 8.5 into an fma for only some of the values, which rounds differently from k_set_rows_quant.
+    const int nblocks0 = (nblk0 + blockDim.x - 1) / blockDim.x;
+    const bool second  = (int) blockIdx.x >= nblocks0;
+    const int  i       = (second ? blockIdx.x - nblocks0 : blockIdx.x)*blockDim.x + threadIdx.x;
+    const float * x    = second ? x1 : x0;
+    const idx_t * idx  = second ? idx1 : idx0;
+    char        * dst  = second ? dst1 : dst0;
+    const int64_t nb1  = second ? nb11 : nb01;
+    const int     nblk = second ? nblk1 : nblk0;
+    if (i >= nblk) {
+        return;
+    }
+    block_q4_0 * row = (block_q4_0 *) (dst + int64_t(idx[0])*nb1);
+    quantize_f32_q4_0_block(x + i*QK4_0, row + i);
+}
+
+bool ggml_cuda_op_set_rows_q4_0_pair(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_tensor * b) {
+    static const bool disabled = getenv("GGML_CUDA_NO_SET_ROWS_PAIR") != nullptr;
+    auto ok = [](const ggml_tensor * t) {
+        const ggml_tensor * x   = t->src[0];
+        const ggml_tensor * idx = t->src[1];
+        return t->type == GGML_TYPE_Q4_0 && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[1] == 1 &&
+            x->ne[2] == 1 && x->ne[3] == 1 && x->ne[0] == t->ne[0] && x->ne[0] % QK4_0 == 0 &&
+            (idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32) && ggml_nelements(idx) == 1 &&
+            t->ne[2] == 1 && t->ne[3] == 1;
+    };
+    if (disabled || !ok(a) || !ok(b) || a->src[1]->type != b->src[1]->type) {
+        return false;
+    }
+    const int nblk0 = a->ne[0] / QK4_0;
+    const int nblk1 = b->ne[0] / QK4_0;
+    const int nthreads = 32;
+    const int nblocks  = (nblk0 + nthreads - 1) / nthreads + (nblk1 + nthreads - 1) / nthreads;
+    if (a->src[1]->type == GGML_TYPE_I64) {
+        k_set_rows_q4_0_pair<int64_t><<<nblocks, nthreads, 0, ctx.stream()>>>(
+            (const float *) a->src[0]->data, (const int64_t *) a->src[1]->data, (char *) a->data, a->nb[1], nblk0,
+            (const float *) b->src[0]->data, (const int64_t *) b->src[1]->data, (char *) b->data, b->nb[1], nblk1);
+    } else {
+        k_set_rows_q4_0_pair<int32_t><<<nblocks, nthreads, 0, ctx.stream()>>>(
+            (const float *) a->src[0]->data, (const int32_t *) a->src[1]->data, (char *) a->data, a->nb[1], nblk0,
+            (const float *) b->src[0]->data, (const int32_t *) b->src[1]->data, (char *) b->data, b->nb[1], nblk1);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}

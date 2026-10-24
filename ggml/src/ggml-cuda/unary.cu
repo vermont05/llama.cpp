@@ -611,6 +611,25 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     }
 }
 
+// CONT(strided 2D view) -> SIGMOID -> MUL: the gated kernel reads the view rows directly, so the copy is not needed.
+// Same per-element arithmetic as the unfused ops. GGML_CUDA_NO_CONT_SIGMOID_MUL=1 disables it.
+bool ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    static const bool disabled = getenv("GGML_CUDA_NO_CONT_SIGMOID_MUL") != nullptr;
+    const ggml_tensor * view  = cont->src[0];
+    const ggml_tensor * other = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+    if (disabled || view->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || mul_node->type != GGML_TYPE_F32 ||
+            cont->type != GGML_TYPE_F32 || unary_node->type != GGML_TYPE_F32 ||
+            view->nb[0] != sizeof(float) || view->ne[2] != 1 || view->ne[3] != 1 || view->nb[1] % sizeof(float) != 0 ||
+            !ggml_is_contiguous(cont) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mul_node) ||
+            ggml_nelements(other) != ggml_nelements(view) || ggml_nelements(mul_node) != ggml_nelements(view)) {
+        return false;
+    }
+    const int64_t nc = view->ne[0];
+    unary_gated_cuda<op_sigmoid>((const float *) view->data, (const float *) other->data, (float *) mul_node->data,
+        ggml_nelements(mul_node), nc, view->nb[1] / sizeof(float), nc, ctx.stream());
+    return true;
+}
+
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     switch (ggml_get_unary_op(unary_node)) {
         case GGML_UNARY_OP_SILU:
