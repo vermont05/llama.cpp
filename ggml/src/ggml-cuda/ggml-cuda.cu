@@ -27,6 +27,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/ssm-conv-step.cuh"
+#include "ggml-cuda/gated-norm.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -4212,6 +4213,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     static const bool conv_step_check = getenv("GGML_CUDA_CONV_STEP_CHECK") != nullptr;
     if (conv_step_check) {
         ggml_cuda_conv_step_check_node(*cuda_ctx, cgraph, i);
+    }
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_gn = ggml_cuda_try_fuse_gated_norm(*cuda_ctx, cgraph, i);
+        if (n_gn > 0) {
+            return n_gn;
+        }
     }
     if (node->op == GGML_OP_GET_ROWS) {
         const int n_conv = ggml_cuda_try_fuse_conv_step(*cuda_ctx, cgraph, i);
