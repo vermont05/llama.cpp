@@ -570,8 +570,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
 
-    // Reshape back to original dimensions
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+    // Reshape back to original dimensions. Skipped when it would be a no-op, so that the residual add directly
+    // follows the matmul and the backend can fuse it into the matmul's epilogue.
+    if (cur->ne[0] != n_embd || cur->ne[1] != n_seq_tokens * n_seqs || cur->ne[2] != 1 || cur->ne[3] != 1) {
+        cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+    }
 
     return cur;
 }
