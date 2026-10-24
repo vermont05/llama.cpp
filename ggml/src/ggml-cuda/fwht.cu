@@ -137,6 +137,42 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
 #define FWHT_BLOCK_THREADS 256
 
 // FWHT stages on one N-wide row held as NE = N/NT registers per thread, then store dst (and q8_1).
+// xor lane exchange within a wave32: DPP row_xmask / permlanex16 on RDNA (no LDS round trip as with
+// ds_bpermute), __shfl_xor_sync elsewhere. Same pairing either way, so the arithmetic is unchanged.
+template <int h>
+static __device__ __forceinline__ float fwht_xor(const float x) {
+#if defined(GGML_USE_HIP) && defined(RDNA)
+    if constexpr (h == 16) {
+        return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(x), __float_as_int(x), 0x76543210, 0xfedcba98, false, false));
+    } else {
+        return __int_as_float(__builtin_amdgcn_update_dpp(__float_as_int(x), __float_as_int(x), 0x160 | h, 0xF, 0xF, false));
+    }
+#else
+    return __shfl_xor_sync(0xFFFFFFFF, x, h, WARP_SIZE);
+#endif // defined(GGML_USE_HIP) && defined(RDNA)
+}
+
+// warp_reduce_sum / warp_reduce_max over 32 lanes with the same order (offset 16 first).
+static __device__ __forceinline__ float fwht_warp_sum(float x) {
+    x += fwht_xor<16>(x); x += fwht_xor<8>(x); x += fwht_xor<4>(x); x += fwht_xor<2>(x); x += fwht_xor<1>(x);
+    return x;
+}
+static __device__ __forceinline__ float fwht_warp_max(float x) {
+    x = fmaxf(x, fwht_xor<16>(x)); x = fmaxf(x, fwht_xor<8>(x)); x = fmaxf(x, fwht_xor<4>(x));
+    x = fmaxf(x, fwht_xor<2>(x));  x = fmaxf(x, fwht_xor<1>(x));
+    return x;
+}
+
+template <int h, int NE>
+static __device__ __forceinline__ void fwht_lane_stage(float (&reg)[NE], const int lane) {
+#pragma unroll
+    for (int j = 0; j < NE; j++) {
+        const float val  = reg[j];
+        const float val2 = fwht_xor<h>(val);
+        reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+    }
+}
+
 template <int N, int NT>
 static __device__ __forceinline__ void fwht_block_finish(float (&reg)[N / NT], float * s, const int64_t r,
                                                          float * dst, block_q8_1 * q8) {
@@ -147,13 +183,21 @@ static __device__ __forceinline__ void fwht_block_finish(float (&reg)[N / NT], f
     const int lane = tid % warp_size;
 
     // stages within a warp: partner differs in the lane bits
+    if constexpr (warp_size == 32) {
+        fwht_lane_stage<1>(reg, lane);
+        fwht_lane_stage<2>(reg, lane);
+        fwht_lane_stage<4>(reg, lane);
+        fwht_lane_stage<8>(reg, lane);
+        fwht_lane_stage<16>(reg, lane);
+    } else {
 #pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
+        for (int h = 1; h < warp_size; h *= 2) {
 #pragma unroll
-        for (int j = 0; j < NE; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+            for (int j = 0; j < NE; j++) {
+                const float val  = reg[j];
+                const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+                reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+            }
         }
     }
 
@@ -201,8 +245,8 @@ static __device__ __forceinline__ void fwht_block_finish(float (&reg)[N / NT], f
 #pragma unroll
         for (int i = 0; i < NE; ++i) {
             const float xi   = reg[i];
-            const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
-            const float sum  = warp_reduce_sum<QK8_1>(xi);
+            const float amax = warp_size == 32 ? fwht_warp_max(fabsf(xi)) : warp_reduce_max<QK8_1>(fabsf(xi));
+            const float sum  = warp_size == 32 ? fwht_warp_sum(xi)        : warp_reduce_sum<QK8_1>(xi);
             const float  d = amax / 127.0f;
             const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
@@ -281,14 +325,15 @@ __global__ void fwht_rms_norm_block(const float * x, const float * w, float * no
             const float xi = x[col];
             tmp += xi * xi;
         }
-        tmp = warp_reduce_sum(tmp);
+        tmp = WARP_SIZE == 32 ? fwht_warp_sum(tmp) : warp_reduce_sum(tmp);
         if (v % WARP_SIZE == 0) {
             s_sum[v / WARP_SIZE] = tmp;
         }
     }
     __syncthreads();
     const int   lane   = tid % WARP_SIZE;
-    const float sum    = warp_reduce_sum(lane < vt / WARP_SIZE ? s_sum[lane] : 0.0f);
+    const float sum_in = lane < vt / WARP_SIZE ? s_sum[lane] : 0.0f;
+    const float sum    = WARP_SIZE == 32 ? fwht_warp_sum(sum_in) : warp_reduce_sum(sum_in);
     const float rscale = rsqrtf(sum / ncols + eps);
 
     const float * signs_row = signs + (r % n_blk) * N;
