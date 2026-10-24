@@ -611,6 +611,72 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     }
 }
 
+// FWHT-64 (the attention output rotation, as fwht_cuda<64>: scale at load, lane stages, one register stage)
+// followed by sigmoid(gate view) * value (as the CONT+SIGMOID+MUL fusion below), one warp per 64-value row.
+static __global__ void fwht64_sigmoid_mul(const float * __restrict__ src, const float * __restrict__ gate, float * __restrict__ dst,
+        const int64_t n_rows, const float scale, const int nc, const int64_t gate_stride) {
+#pragma clang fp contract(off)
+    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= n_rows) {
+        return;
+    }
+    const int lane = threadIdx.x;
+    float reg[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        reg[i] = src[r*64 + i*WARP_SIZE + lane] * scale;
+    }
+#pragma unroll
+    for (int h = 1; h < WARP_SIZE; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const float val  = reg[j];
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, WARP_SIZE);
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+    {
+        const float x = reg[0];
+        const float y = reg[1];
+        reg[0] = x + y;
+        reg[1] = x - y;
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int64_t k = r*64 + i*WARP_SIZE + lane;
+        dst[k] = op_sigmoid(gate[(k / nc)*gate_stride + k % nc]) * reg[i];
+    }
+}
+
+bool ggml_cuda_op_fwht64_sigmoid_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * cont,
+        ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    static const bool disabled = getenv("GGML_CUDA_NO_FWHT64_GATE") != nullptr;
+    const ggml_tensor * x    = mm->src[1];
+    const ggml_tensor * view = cont->src[0];
+    if (disabled || mm->ne[0] != 64 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || mm->type != GGML_TYPE_F32 ||
+            view->type != GGML_TYPE_F32 || view->nb[0] != sizeof(float) || view->ne[2] != 1 || view->ne[3] != 1 ||
+            view->nb[1] % sizeof(float) != 0 || mul_node->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul_node) ||
+            ggml_nelements(mul_node) != ggml_nelements(view) || ggml_nelements(mm) != ggml_nelements(mul_node) ||
+            ggml_nelements(x) != ggml_nelements(mm)) {
+        return false;
+    }
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    // in place of x is fine (each warp reads its row before writing it); any other overlap is not
+    if ((overlaps(mul_node, x) && mul_node->data != x->data) || overlaps(mul_node, view->view_src ? view->view_src : view)) {
+        return false;
+    }
+    const int64_t rows = ggml_nelements(mm) / 64;
+    const dim3 grid((rows + 3) / 4, 1, 1), block(WARP_SIZE, 4, 1);
+    fwht64_sigmoid_mul<<<grid, block, 0, ctx.stream()>>>((const float *) x->data, (const float *) view->data,
+        (float *) mul_node->data, rows, 1 / sqrtf(64), view->ne[0], view->nb[1] / sizeof(float));
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // CONT(strided 2D view) -> SIGMOID -> MUL: the gated kernel reads the view rows directly, so the copy is not needed.
 // Same per-element arithmetic as the unfused ops. GGML_CUDA_NO_CONT_SIGMOID_MUL=1 disables it.
 bool ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * unary_node, ggml_tensor * mul_node) {

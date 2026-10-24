@@ -4239,6 +4239,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (conv_step_check) {
         ggml_cuda_conv_step_check_node(*cuda_ctx, cgraph, i);
     }
+    // FWHT-64 hint matmul -> RESHAPE -> VIEW(gate) -> CONT -> SIGMOID -> MUL(reshape, sigmoid): one kernel
+    if (node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD && node->ne[0] == 64 &&
+            i + 5 < cgraph->n_nodes) {
+        ggml_tensor * resh = cgraph->nodes[i + 1];
+        ggml_tensor * view = cgraph->nodes[i + 2];
+        ggml_tensor * cont = cgraph->nodes[i + 3];
+        ggml_tensor * un   = cgraph->nodes[i + 4];
+        ggml_tensor * mul  = cgraph->nodes[i + 5];
+        if (resh->op == GGML_OP_RESHAPE && resh->src[0] == node && view->op == GGML_OP_VIEW && cont->op == GGML_OP_CONT &&
+                cont->src[0] == view && un->op == GGML_OP_UNARY && ggml_get_unary_op(un) == GGML_UNARY_OP_SIGMOID &&
+                un->src[0] == cont && mul->op == GGML_OP_MUL &&
+                ((mul->src[0] == resh && mul->src[1] == un) || (mul->src[1] == resh && mul->src[0] == un)) &&
+                [&] {
+                    // the intermediates (matmul, reshape, cont, sigmoid) must have no consumer outside the group
+                    for (int k = 0; k < cgraph->n_nodes; ++k) {
+                        const ggml_tensor * n = cgraph->nodes[k];
+                        if (k >= i && k <= i + 5) {
+                            continue;
+                        }
+                        for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
+                            if (n->src[s] == node || n->src[s] == resh || n->src[s] == cont || n->src[s] == un) {
+                                return false;
+                            }
+                        }
+                    }
+                    return !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && !(resh->flags & GGML_TENSOR_FLAG_OUTPUT);
+                }() &&
+                ggml_cuda_op_fwht64_sigmoid_mul(*cuda_ctx, node, cont, un, mul)) {
+            return 5;
+        }
+    }
     if (node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes) {
         ggml_tensor * un  = cgraph->nodes[i + 1];
         ggml_tensor * mul = cgraph->nodes[i + 2];

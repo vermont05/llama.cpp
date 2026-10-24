@@ -115,3 +115,7 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
 
 // CONT(strided 2D view) -> SIGMOID -> MUL as one kernel; false if not applicable.
 bool ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * unary_node, ggml_tensor * mul_node);
+
+// FWHT-64 hint matmul + (RESHAPE) + CONT(gate view) + SIGMOID + MUL as one kernel; false if not applicable.
+bool ggml_cuda_op_fwht64_sigmoid_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * cont,
+        ggml_tensor * unary_node, ggml_tensor * mul_node);
