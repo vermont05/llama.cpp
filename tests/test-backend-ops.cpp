@@ -10109,7 +10109,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q1_0));
-    for (ggml_type t : {GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0}) {
+    for (ggml_type t : {GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_Q4_0}) {
         test_cases.emplace_back(new test_mul_mat_stack(t, 5120, {6144, 10240, 0}));
         test_cases.emplace_back(new test_mul_mat_stack(t, 5120, {12288, 1024, 1024}));
         test_cases.emplace_back(new test_mul_mat_stack(t, 1024, {64, 8, 0}));
@@ -10332,11 +10332,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // PQ2_0 single-token matvec at Qwen3.5-27B shapes (launch overhead vs. size)
-    for (int64_t m : {1024, 2048, 5120, 10240, 17408, 34816, 69632, 139264, 248320}) {
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, m, 1, 5120, {1, 1}, {1, 1}));
+    // PQ2_0 / PTQ1_0 single-token matvec at Qwen3.5-27B shapes (launch overhead vs. size)
+    for (ggml_type t : {GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0}) {
+        for (int64_t m : {1024, 2048, 5120, 10240, 17408, 34816, 69632, 139264, 248320}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, 1, 5120, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
     }
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
     // Qwen3.5-27B full-attention decode: 24 Q heads, 4 K/V heads, head size 256.
     for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
         for (int kv : {4096, 16384, 40960}) {

@@ -804,7 +804,42 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     return d2 * d8 * sumi;
 }
 
-#if !defined(GGML_USE_HIP)
+// PTQ1_0 byte helpers: __byte_perm on CUDA, v_perm_b32 on HIP (whose __byte_perm is a software routine).
+// v_perm_b32 takes bytes 0..3 from its second operand, selector byte 0x0C gives 0x00.
+// Bytes 0, 1 of p -> 16-bit lanes 0, 1.
+static __device__ __forceinline__ uint32_t ptq1_widen_lo(const uint32_t p) {
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_perm(0u, p, 0x0C010C00u);
+#else
+    return __byte_perm(p, 0, 0x4140);
+#endif
+}
+
+// Bytes 2, 3 of p -> 16-bit lanes 0, 1.
+static __device__ __forceinline__ uint32_t ptq1_widen_hi(const uint32_t p) {
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_perm(0u, p, 0x0C030C02u);
+#else
+    return __byte_perm(p, 0, 0x4342);
+#endif
+}
+
+// High bytes of the four 16-bit lanes of (a, b): one trit (0..2) per byte. CUDA subtracts the
+// bias here; HIP leaves it and vec_dot_ptq1_0_q8_1_multi subtracts sum(u) once per chunk instead.
+static __device__ __forceinline__ int ptq1_trits4(const uint32_t a, const uint32_t b) {
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+    return (int) __builtin_amdgcn_perm(b, a, 0x07050301u);
+#else
+    return __vsub4(__byte_perm(a, b, 0x7531), 0x01010101);
+#endif
+}
+
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+static constexpr bool ptq1_late_bias = true;
+#else
+static constexpr bool ptq1_late_bias = false;
+#endif
+
 template <int ncols_dst>
 static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __restrict__ vbq,
                                                                  const block_q8_1 * __restrict__ bq8_1,
@@ -814,13 +849,14 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
                                                                  float *        result) {
     const block_ptq1_0 * bq                 = (const block_ptq1_0 *) vbq + kbx;
     int                  sumi[ncols_dst][4] = {};
+    int                  sumu[ncols_dst][4] = {}; // sum of the activations, for the late bias
 
     // Widen four bytes to 16-bit lanes so multiply-by-three cannot carry between bytes.
 #    pragma unroll
     for (int g = 0; g < 4; ++g) {
         const uint32_t packed = get_int_b4(bq->qs, g);
-        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
-        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+        uint32_t       v_lo   = ptq1_widen_lo(packed);
+        uint32_t       v_hi   = ptq1_widen_hi(packed);
 
 #    pragma unroll
         for (int t = 0; t < 5; ++t) {
@@ -829,12 +865,15 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
             v_lo                = w_lo & 0x00FF00FF;
             v_hi                = w_hi & 0x00FF00FF;
 
-            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int q = ptq1_trits4(w_lo, w_hi);
             const int e = t * 16 + 4 * g;
 #    pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const int u     = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
                 sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+                if constexpr (ptq1_late_bias) {
+                    sumu[j][e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[j][e >> 5]);
+                }
             }
         }
     }
@@ -842,8 +881,8 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
 #    pragma unroll
     for (int g = 0; g < 2; ++g) {
         const uint32_t packed = get_int_b4(bq->qs + 16, g);
-        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
-        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+        uint32_t       v_lo   = ptq1_widen_lo(packed);
+        uint32_t       v_hi   = ptq1_widen_hi(packed);
 
 #    pragma unroll
         for (int t = 0; t < 5; ++t) {
@@ -852,12 +891,15 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
             v_lo                = w_lo & 0x00FF00FF;
             v_hi                = w_hi & 0x00FF00FF;
 
-            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int q = ptq1_trits4(w_lo, w_hi);
             const int e = 80 + t * 8 + 4 * g;
 #    pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const int u     = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
                 sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+                if constexpr (ptq1_late_bias) {
+                    sumu[j][e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[j][e >> 5]);
+                }
             }
         }
     }
@@ -870,11 +912,14 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
         const uint32_t w1 = v * 3;
         v                 = w1 & 0x00FF00FF;
 
-        const int q = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
+        const int q = ptq1_trits4(w0, w1);
 #    pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
             const int u = get_int_b4(bq8_1[j * stride_col_y + iqs + 3].qs, 6 + t / 2);
             sumi[j][3]  = ggml_cuda_dp4a(q, u, sumi[j][3]);
+            if constexpr (ptq1_late_bias) {
+                sumu[j][3] = ggml_cuda_dp4a(0x01010101, u, sumu[j][3]);
+            }
         }
     }
 
@@ -884,19 +929,28 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
         float acc = 0.0f;
 #    pragma unroll
         for (int k = 0; k < 4; ++k) {
-            acc += __low2float(bq8_1[j * stride_col_y + iqs + k].ds) * (float) sumi[j][k];
+            acc += __low2float(bq8_1[j * stride_col_y + iqs + k].ds) * (float) (sumi[j][k] - sumu[j][k]);
         }
         result[j] = d * acc;
     }
 }
-#endif
 
 // PTQ1_0 x Q8_1. One call consumes the full 128-weight block.
 static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restrict__ vbq,
                                                             const block_q8_1 * __restrict__ bq8_1,
                                                             const int & kbx,
                                                             const int & iqs) {
+    float result;
+    vec_dot_ptq1_0_q8_1_multi<1>(vbq, bq8_1, kbx, iqs, 0, &result);
+    return result;
+}
+
 #if defined(GGML_USE_HIP)
+// The previous HIP path, one trit at a time (GGML_CUDA_NO_PTQ1_0_VEC=1). Same integer sums, same result.
+static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1_scalar(const void * __restrict__ vbq,
+                                                                   const block_q8_1 * __restrict__ bq8_1,
+                                                                   const int & kbx,
+                                                                   const int & iqs) {
     const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq + kbx;
     int                  sumi[4] = { 0, 0, 0, 0 };
 
@@ -945,12 +999,8 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
         acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
     }
     return (float) bq->d * acc;
-#else
-    float result;
-    vec_dot_ptq1_0_q8_1_multi<1>(vbq, bq8_1, kbx, iqs, 0, &result);
-    return result;
-#endif
 }
+#endif
 
 static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(const void * __restrict__ vbq,
                                                            const block_q8_1 * __restrict__ bq8_1,
