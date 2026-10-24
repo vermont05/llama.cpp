@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "gated-norm.cuh"
+#include "fwht.cuh"
 
 // rms_norm(x) * w, then silu(gate) * that, then a head permutation made contiguous, as one kernel. In Qwen3.5 this is
 // the gated norm after the gated delta net (5 nodes, 3 launches: rms_norm+mul, swiglu, cont). One block per output
@@ -89,6 +90,24 @@ int ggml_cuda_try_fuse_gated_norm(ggml_backend_cuda_context & ctx, const ggml_cg
 
     float eps;
     memcpy(&eps, rn->op_params, sizeof(float));
+
+    // + the sign flip and FWHT that follow (RESHAPE, MUL(signs), RESHAPE, FWHT-hint MUL_MAT): one kernel for both
+    if (i + 10 < cgraph->n_nodes) {
+        const ggml_tensor * r1b  = cgraph->nodes[i + 7];
+        const ggml_tensor * smul = cgraph->nodes[i + 8];
+        const ggml_tensor * r2b  = cgraph->nodes[i + 9];
+        ggml_tensor *       mm   = cgraph->nodes[i + 10];
+        if (r1b->op == GGML_OP_RESHAPE && r1b->src[0] == cont && smul->op == GGML_OP_MUL && smul->src[0] == r1b &&
+                r2b->op == GGML_OP_RESHAPE && r2b->src[0] == smul && mm->op == GGML_OP_MUL_MAT && mm->src[1] == r2b &&
+                ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && ggml_is_contiguous(smul) &&
+                smul->src[1]->ne[0] == smul->ne[0] && ggml_nrows(smul->src[1]) == 1 &&
+                !overlaps(mm, x) && !overlaps(mm, gate) && !overlaps(mm, w) && ncols == 128 &&
+                // x and gate are views: the rest of their parent buffers may still be read later (e.g. the GDN state)
+                !overlaps(mm, x->view_src ? x->view_src : x) && !overlaps(mm, gate->view_src ? gate->view_src : gate) &&
+                ggml_cuda_op_gated_norm_fwht(ctx, x, gate, w, eps, perm, smul->src[1], mm, cont)) {
+            return 10;
+        }
+    }
 
     gated_norm_f32<<<perm->ne[1]*perm->ne[2], gated_norm_block, 0, ctx.stream()>>>(
         (const float *) x->data, (const float *) gate->data, (const float *) w->data, (float *) cont->data,

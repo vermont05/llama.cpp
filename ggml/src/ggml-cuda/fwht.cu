@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fwht.cuh"
+#include "unary.cuh"
 #include "quantize.cuh"
 
 #include <cstdlib>
@@ -356,6 +357,179 @@ __global__ void fwht_rms_norm_block(const float * x, const float * w, float * no
     }
 
     fwht_block_finish<N, NT>(reg, s, r, dst, q8);
+}
+
+// Gated norm (rms_norm(x)*w, silu(gate)*that, head permutation; see gated-norm.cu) followed by sign flip + FWHT
+// (N = 1024), one block per 1024-element chunk. The per-head norm sums replay gated_norm_f32's block_reduce<256>
+// (warp sums of 32 values, then one warp over [s0, s1, s2, s3, 0...]); the FWHT input and stages are those of
+// fwht_cuda_block. The permuted row r of the output reads source head (i1*nb1 + i2*nb2)/(128*4).
+static __global__ void fwht_gated_norm_1024(
+        const float * __restrict__ x, const float * __restrict__ gate, const float * __restrict__ w, const float eps,
+        const int ne1, const int64_t nb1, const int64_t nb2, const float scale, const float * __restrict__ signs,
+        const int n_blk, float * __restrict__ dst, block_q8_1 * q8, const int ncols, float * dbg_out = nullptr) {
+    constexpr int N = 1024, NT = 256, NE = N / NT, HD = 128, NH = N / HD;
+    __shared__ float s[N];
+    __shared__ float scale_s[NH];
+    __shared__ int   head_s[NH];
+
+    const int64_t r    = blockIdx.x;
+    const int     tid  = threadIdx.x;
+    const int     lane = tid % WARP_SIZE;
+    const int     warp = tid / WARP_SIZE; // 8 warps: warp k does output row k of the chunk
+
+    ggml_cuda_pdl_sync();
+    {
+        const int ro = r*NH + warp;              // output (permuted) row
+        const int i1 = ro % ne1;
+        const int i2 = ro / ne1;
+        const int h  = (i1*nb1 + i2*nb2) / (HD*int64_t(sizeof(float)));
+        const float * xr = x + int64_t(h)*HD;
+        float part[4];
+        {
+            // The square must be rounded on its own, as in gated_norm_f32's loop; with contraction the compiler fuses
+            // it into the first butterfly add (fma(x, x, partner)) and the sum changes in the last bit.
+#pragma clang fp contract(off)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const float xi = xr[q*WARP_SIZE + lane];
+                const float tmp = xi * xi;
+                part[q] = warp_reduce_sum<WARP_SIZE>(tmp);
+            }
+        }
+        float v = lane == 0 ? part[0] : lane == 1 ? part[1] : lane == 2 ? part[2] : lane == 3 ? part[3] : 0.0f;
+        v = warp_reduce_sum<WARP_SIZE>(v);
+        // ncols (== HD) at run time, as in gated_norm_f32: with a constant divisor the compiler turns v/128 + eps
+        // into one fma, which skips the rounding of the quotient and changes the result in the last bit.
+        const float mean = v / ncols;
+        if (lane == 0) {
+            scale_s[warp] = rsqrtf(mean + eps);
+            head_s[warp]  = h;
+            if (dbg_out) {
+                dbg_out[2*6144 + 3*ro + 0] = v;
+                dbg_out[2*6144 + 3*ro + 1] = rsqrtf(mean + eps);
+                dbg_out[2*6144 + 3*ro + 2] = __int_as_float(h);
+            }
+        }
+    }
+    __syncthreads();
+
+    const float * signs_row = signs + (r % n_blk) * N;
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const int e = i*NT + tid;
+        const int k = e / HD;
+        const int d = e % HD;
+        const int64_t src = int64_t(head_s[k])*HD + d;
+        const float n   = scale_s[k] * x[src] * w[d];
+        const float out = ggml_cuda_op_silu_single(gate[src]) * n;
+        if (dbg_out) {
+            dbg_out[r*N + e] = out;
+        }
+        reg[i] = out * scale;
+        reg[i] *= signs_row[e];
+    }
+    fwht_block_finish<N, NT>(reg, s, r, dst, q8);
+}
+
+gn_fwht_pending ggml_cuda_gn_fwht_pending;
+
+void ggml_cuda_gn_fwht_check_pre(ggml_backend_cuda_context & ctx) {
+    gn_fwht_pending & p = ggml_cuda_gn_fwht_pending;
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        // the pre-FWHT values against the original CONT output
+        std::vector<float> c(p.n), o(p.n);
+        CUDA_CHECK(cudaMemcpy(c.data(), p.scratch + p.n, p.n*sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(o.data(), p.cont->data, p.n*sizeof(float), cudaMemcpyDeviceToHost));
+        int nc = 0;
+        for (int k = 0; k < p.n; ++k) {
+            if (memcmp(&c[k], &o[k], 4) != 0) {
+                if (nc < 3) {
+                    fprintf(stderr, "  pre-FWHT diff [%d] (row %d): fused %.9g orig %.9g\n", k, k/128, c[k], o[k]);
+                }
+                nc++;
+            }
+        }
+        fprintf(stderr, "  pre-FWHT: %d of %d differ\n", nc, p.n);
+        if (nc) {
+            // host replay of the row sum in the GPU order for the first differing row
+            const int row = [&]{ for (int k = 0; k < p.n; ++k) if (memcmp(&c[k], &o[k], 4) != 0) return k/128; return 0; }();
+            std::vector<float> dbg(3*48);
+            CUDA_CHECK(cudaMemcpy(dbg.data(), p.scratch + p.n + 2*6144, dbg.size()*sizeof(float), cudaMemcpyDeviceToHost));
+            int h; memcpy(&h, &dbg[3*row + 2], 4);
+            std::vector<float> xr(128);
+            CUDA_CHECK(cudaMemcpy(xr.data(), (const float *) p.x->data + int64_t(h)*128, 128*sizeof(float), cudaMemcpyDeviceToHost));
+            float part[4];
+            for (int q = 0; q < 4; ++q) {
+                float l[32];
+                for (int ln = 0; ln < 32; ++ln) { volatile float t = xr[32*q + ln]*xr[32*q + ln]; l[ln] = t; }
+                for (int off = 16; off > 0; off >>= 1) { float nl[32]; for (int ln = 0; ln < 32; ++ln) { volatile float t = l[ln] + l[ln ^ off]; nl[ln] = t; } memcpy(l, nl, sizeof l); }
+                part[q] = l[0];
+            }
+            float l[32] = {0}; for (int q = 0; q < 4; ++q) l[q] = part[q];
+            for (int off = 16; off > 0; off >>= 1) { float nl[32]; for (int ln = 0; ln < 32; ++ln) { volatile float t = l[ln] + l[ln ^ off]; nl[ln] = t; } memcpy(l, nl, sizeof l); }
+            fprintf(stderr, "  row %d head %d: fused sum %.9g scale %.9g | host sum %.9g | orig/fused ratio %.9g\n",
+                row, h, dbg[3*row], dbg[3*row + 1], l[0], o[row*128 + 1] / c[row*128 + 1]);
+        }
+}
+
+void ggml_cuda_gn_fwht_check(ggml_backend_cuda_context & ctx) {
+    gn_fwht_pending & p = ggml_cuda_gn_fwht_pending;
+    if (!p.mm) {
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    std::vector<float> a(p.n), b(p.n);
+    CUDA_CHECK(cudaMemcpy(a.data(), p.scratch, p.n*sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b.data(), p.mm->data, p.n*sizeof(float), cudaMemcpyDeviceToHost));
+    int nd = 0;
+    for (int k = 0; k < p.n; ++k) {
+        if (memcmp(&a[k], &b[k], 4) != 0) {
+            if (nd < 3) {
+                fprintf(stderr, "gn_fwht diff %s [%d]: fused %.9g orig %.9g\n", p.mm->name, k, a[k], b[k]);
+            }
+            nd++;
+        }
+    }
+    if (nd) {
+        fprintf(stderr, "gn_fwht %s: %d of %d differ\n", p.mm->name, nd, p.n);
+    }
+    p.mm = nullptr;
+}
+
+bool ggml_cuda_op_gated_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * gate,
+        const ggml_tensor * w, const float eps, const ggml_tensor * perm, const ggml_tensor * signs, ggml_tensor * mm,
+        const ggml_tensor * cont_dbg) {
+    static const bool disabled = getenv("GGML_CUDA_NO_GATED_NORM_FWHT") != nullptr;
+    const int n = mm->ne[0];
+    if (disabled || n != 1024 || x->ne[0] != 128 || signs->type != GGML_TYPE_F32 || !ggml_is_contiguous(signs) ||
+            signs->ne[0] % n != 0 || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) ||
+            ggml_nelements(mm) != ggml_nelements(x) || ggml_nelements(mm) % n != 0) {
+        return false;
+    }
+    const int64_t rows = ggml_nelements(mm) / n;
+    static const bool check = getenv("GGML_CUDA_GN_FWHT_CHECK") != nullptr;
+    if (check) {
+        // debug: compute into scratch and compare with the unfused result after it is produced (see check_node)
+        static float * scratch = nullptr;
+        if (!scratch) {
+            CUDA_CHECK(cudaMalloc(&scratch, ggml_nbytes(mm)*5));
+        }
+        fwht_gated_norm_1024<<<rows, 256, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) gate->data, (const float *) w->data, eps,
+            perm->ne[1], perm->nb[1], perm->nb[2], 1 / sqrtf(n), (const float *) signs->data, signs->ne[0] / n,
+            scratch, nullptr, x->ne[0], scratch + ggml_nelements(mm));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        ggml_cuda_gn_fwht_pending = { mm, scratch, (int) ggml_nelements(mm), cont_dbg, x };
+        return false;
+    }
+    block_q8_1 * q8 = ggml_cuda_q8_1_cache_put(ctx, mm);
+    fwht_gated_norm_1024<<<rows, 256, 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) gate->data, (const float *) w->data, eps,
+        perm->ne[1], perm->nb[1], perm->nb[2], 1 / sqrtf(n), (const float *) signs->data, signs->ne[0] / n,
+        (float *) mm->data, q8, x->ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 bool ggml_cuda_op_rms_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul,

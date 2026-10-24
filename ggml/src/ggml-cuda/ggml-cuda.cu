@@ -3424,6 +3424,14 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (ggml_cuda_gn_fwht_pending.mm != nullptr && cgraph->nodes[i]->op == GGML_OP_MUL && cgraph->nodes[i]->src[0] &&
+            cgraph->nodes[i]->src[0]->src[0] == ggml_cuda_gn_fwht_pending.cont) {
+        ggml_cuda_gn_fwht_check_pre(*cuda_ctx); // debug: the unfused CONT ran, compare the pre-FWHT values
+    }
+    if (ggml_cuda_gn_fwht_pending.mm != nullptr && cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->src[1] &&
+            cgraph->nodes[i]->src[1]->src[0] == ggml_cuda_gn_fwht_pending.mm) {
+        ggml_cuda_gn_fwht_check(*cuda_ctx); // debug: the unfused FWHT ran, compare
+    }
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
