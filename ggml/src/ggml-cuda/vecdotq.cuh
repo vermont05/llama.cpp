@@ -834,6 +834,24 @@ static __device__ __forceinline__ int ptq1_trits4(const uint32_t a, const uint32
 #endif
 }
 
+// High bytes of the four 16-bit lanes of (a, b) as they are: four trits 0..2.
+static __device__ __forceinline__ uint32_t ptq1_trits4_unsigned(const uint32_t a, const uint32_t b) {
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_perm(b, a, 0x07050301u);
+#else
+    return __byte_perm(a, b, 0x7531);
+#endif
+}
+
+// Same as ptq1_trits4 but always signed (-1, 0, +1), for the MMQ tile; HIP maps 0..2 through a v_perm table.
+static __device__ __forceinline__ int ptq1_trits4_signed(const uint32_t a, const uint32_t b) {
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+    return (int) __builtin_amdgcn_perm(0x020100FFu, 0x020100FFu, __builtin_amdgcn_perm(b, a, 0x07050301u));
+#else
+    return __vsub4(__byte_perm(a, b, 0x7531), 0x01010101);
+#endif
+}
+
 #if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
 static constexpr bool ptq1_late_bias = true;
 #else

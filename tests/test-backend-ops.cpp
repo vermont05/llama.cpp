@@ -10109,6 +10109,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q1_0));
+    // PQ2_0 / PTQ1_0 prompt-sized matmuls at Qwen3.5-27B widths, with row (m % 128) and column tails (MMQ path).
+    for (ggml_type t : {GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120, 256, 5120,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1000,  77, 5120,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 6144, 129, 17408, {1, 1}, {1, 1}));
+    }
     for (ggml_type t : {GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_Q4_0}) {
         test_cases.emplace_back(new test_mul_mat_stack(t, 5120, {6144, 10240, 0}));
         test_cases.emplace_back(new test_mul_mat_stack(t, 5120, {12288, 1024, 1024}));

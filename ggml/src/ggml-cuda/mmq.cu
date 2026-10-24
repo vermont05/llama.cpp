@@ -17,11 +17,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_PQ2_0:
             mul_mat_q_case<GGML_TYPE_PQ2_0>(ctx, args, stream);
             break;
-#if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
             mul_mat_q_case<GGML_TYPE_PTQ1_0>(ctx, args, stream);
             break;
-#endif
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
             break;
@@ -95,6 +93,56 @@ static size_t ggml_cuda_mmq_q8_buffer_size(
         ggml_type type, bool fallback, int cc,
         int64_t ne10_padded, int64_t ne11, int64_t ne12, int64_t ne13);
 
+#if defined(GGML_USE_HIP)
+// Four trits (one per byte, 0..2) -> one PQ2_0 byte: code k at bits 2k, code = trit (PQ2_0 symbol = code - 1).
+static __device__ __forceinline__ uint8_t ptq1_0_pack_codes(const uint32_t q) {
+    const uint32_t y = q | (q >> 6);
+    return (uint8_t) (y | (y >> 12));
+}
+
+// PTQ1_0 -> PQ2_0, exact: same 128-weight groups, same scale, the trits become PQ2_0 codes. 8 threads per block, one
+// per 4-byte trit group (the PTQ1_0 order of weights is the one vec_dot_ptq1_0_q8_1_multi decodes).
+static constexpr int ptq1_0_repack_threads = 256;
+static constexpr int ptq1_0_repack_blocks  = ptq1_0_repack_threads / 8;
+
+static __global__ void ptq1_0_to_pq2_0(const block_ptq1_0 * __restrict__ x, block_pq2_0 * __restrict__ y, const int64_t nblocks) {
+    const int64_t ib   = (int64_t) blockIdx.x*ptq1_0_repack_blocks + threadIdx.x/8;
+    const int     lane = threadIdx.x % 8;
+    if (ib >= nblocks) {
+        return;
+    }
+    const block_ptq1_0 * bx = x + ib;
+    uint8_t *            qs = y[ib].qs;
+
+    if (lane < 6) {
+        const int      g      = lane < 4 ? lane : lane - 4;
+        const uint32_t packed = lane < 4 ? get_int_b4(bx->qs, g) : get_int_b4(bx->qs + 16, g);
+        uint32_t       v_lo   = ptq1_widen_lo(packed);
+        uint32_t       v_hi   = ptq1_widen_hi(packed);
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+            qs[lane < 4 ? 4*t + g : 20 + 2*t + g] = ptq1_0_pack_codes(ptq1_trits4_unsigned(w_lo, w_hi));
+        }
+    } else if (lane == 6) {
+        uint32_t v = (uint32_t) bx->qh[0] | ((uint32_t) bx->qh[1] << 16);
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            const uint32_t w0 = v * 3;
+            v                 = w0 & 0x00FF00FF;
+            const uint32_t w1 = v * 3;
+            v                 = w1 & 0x00FF00FF;
+            qs[30 + t] = ptq1_0_pack_codes(ptq1_trits4_unsigned(w0, w1));
+        }
+    } else {
+        y[ib].d = bx->d;
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst, const ggml_tensor * gate,
@@ -125,6 +173,7 @@ void ggml_cuda_mul_mat_q(
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
+    ggml_type     type_x = src0->type;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -148,6 +197,26 @@ void ggml_cuda_mul_mat_q(
 
     const bool fallback = ne01 % 128 != 0;
 
+#if defined(GGML_USE_HIP)
+    // PTQ1_0 prompt batches: repack the weights to PQ2_0 once and run the PQ2_0 kernel. The PTQ1_0 tile loader redoes
+    // its base-3 decode for every column tile, the PQ2_0 one is a byte lookup; the result is the same.
+    // GGML_CUDA_PTQ1_0_REPACK_MIN=<n> sets the smallest batch that repacks (default 0: always).
+    static const int64_t ptq1_repack_min = [] {
+        const char * s = getenv("GGML_CUDA_PTQ1_0_REPACK_MIN");
+        return s ? (int64_t) atoll(s) : (int64_t) 0;
+    }();
+    ggml_cuda_pool_alloc<char> src0_pq2_0(ctx.pool());
+    if (src0->type == GGML_TYPE_PTQ1_0 && !ids && ne11 >= ptq1_repack_min && ggml_is_contiguous(src0)) {
+        const int64_t nblocks = ggml_nelements(src0) / QK_PTQ1_0;
+        src0_pq2_0.alloc(nblocks*sizeof(block_pq2_0));
+        ptq1_0_to_pq2_0<<<(nblocks + ptq1_0_repack_blocks - 1) / ptq1_0_repack_blocks, ptq1_0_repack_threads, 0, stream>>>(
+            (const block_ptq1_0 *) src0_d, (block_pq2_0 *) src0_pq2_0.ptr, nblocks);
+        CUDA_CHECK(cudaGetLastError());
+        src0_d = src0_pq2_0.ptr;
+        type_x = GGML_TYPE_PQ2_0;
+    }
+#endif // defined(GGML_USE_HIP)
+
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
@@ -155,8 +224,8 @@ void ggml_cuda_mul_mat_q(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = use_native_fp4 ?
             ne13*ne12*ne11*ne10_padded*y_block_size/y_values_per_block +
-                ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11)*sizeof(block_q8_1_mmq) :
-            ggml_cuda_mmq_q8_buffer_size(src0->type, fallback, cc, ne10_padded, ne11, ne12, ne13);
+                ggml_cuda_mmq_get_J_max(type_x, fallback, cc, ne11)*sizeof(block_q8_1_mmq) :
+            ggml_cuda_mmq_q8_buffer_size(type_x, fallback, cc, ne10_padded, ne11, ne12, ne13);
         GGML_ASSERT(!external_q8 || (!gate && !use_native_fp4));
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
         char * src1_q8_ptr = external_q8 ? (char *) external_q8 : src1_q8_1.alloc(nbytes_src1_q8_1);
@@ -184,15 +253,15 @@ void ggml_cuda_mul_mat_q(
                                 ggml_nelements(norm_scale) >= ggml_nrows(src1)));
                     quantize_mmq_q8_1_rms_cuda(src1_d, (const float *) norm_weight->data,
                                                external_norm_scale ? external_norm_scale : (const float *) norm_scale->data,
-                                               src1_q8_ptr, src0->type,
+                                               src1_q8_ptr, type_x,
                                                ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
                 } else if (gate) {
                     GGML_ASSERT(ggml_are_same_shape(src1, gate));
                     GGML_ASSERT(ggml_is_contiguous(gate));
-                    quantize_mmq_q8_1_swiglu_cuda(src1_d, (const float *) gate->data, src1_q8_ptr, src0->type,
+                    quantize_mmq_q8_1_swiglu_cuda(src1_d, (const float *) gate->data, src1_q8_ptr, type_x,
                                                   ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
                 } else {
-                    quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
+                    quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_ptr, type_x, ne10, s11, s12, s13, ne10_padded,
                                            ne11, ne12, ne13, stream);
                 }
             }
@@ -206,7 +275,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_ptr, nullptr, nullptr, dst_d,
+            src0_d, type_x, (const int *) src1_q8_ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -371,11 +440,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     bool mmq_supported;
 
     switch (type) {
-#if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
-            mmq_supported = turing_mma_available(cc);
+            // HIP: only RDNA3 is tested (WMMA tile layout); elsewhere the f16 dequant fallback stays.
+            mmq_supported = turing_mma_available(cc) || GGML_CUDA_CC_IS_RDNA3(cc);
             break;
-#endif
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_PQ2_0:
@@ -422,7 +490,6 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         }
     }
 
-#if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_0) {
         // the fp16 dequantize + cuBLAS fallback is the source of PTQ1_0's extra error on CUDA, so
         // the MMQ tile path runs at every batch by default; the env var is the A/B knob for
@@ -433,7 +500,6 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         }();
         return ne11 <= max_batch;
     }
-#endif
 
     if (turing_mma_available(cc)) {
         return true;
