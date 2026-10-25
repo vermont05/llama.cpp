@@ -455,8 +455,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 // Loading a K/V tile stored as q4_0 into shared memory as f16, in the same layout as flash_attn_ext_f16_load_tile.
 // KV points at the first q4_0 block of the first row, stride_KV is in units of 4 bytes. Each thread converts one
 // block per step: 5 aligned 4-byte loads (a block is 18 bytes, so it starts 0 or 2 bytes into a word), 4 x 16-byte
-// shared memory stores. Split into fetch (global -> registers) and store (convert, registers -> shared memory) so
-// the global loads can be issued early. (q - 8)*d is computed in f16, the same as a f16 copy up to f16 denormals.
+// shared memory stores. Consecutive threads take the same block of consecutive rows: the shared memory row stride is
+// 16 bytes off a multiple of the bank width, so their stores do not conflict (8 blocks of one row would, 64 bytes
+// apart). Split into fetch (global -> registers) and store (convert, registers -> shared memory) so the global loads
+// can be issued early. (q - 8)*d is computed in f16, the same as a f16 copy up to f16 denormals.
 template<int nthreads, int nbatch_fa, int D2>
 struct fattn_q4_0_tile {
     static constexpr int blocks_per_row = 2*D2/QK4_0;
@@ -477,8 +479,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_fetch_tile_q4_0(
     const int tid = threadIdx.y*warp_size + threadIdx.x;
 #pragma unroll
     for (int s = 0; s < T::nsteps; ++s) {
-        const int i  = (s*nwarps*warp_size + tid) / T::blocks_per_row;
-        const int ib = (s*nwarps*warp_size + tid) % T::blocks_per_row;
+        const int i  = (s*nwarps*warp_size + tid) % nbatch_fa;
+        const int ib = (s*nwarps*warp_size + tid) / nbatch_fa;
         if (oob_check && i >= i_sup) {
 #pragma unroll
             for (int l = 0; l < 5; ++l) {
@@ -508,8 +510,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_store_tile_q4_0(
     const int tid = threadIdx.y*warp_size + threadIdx.x;
 #pragma unroll
     for (int s = 0; s < T::nsteps; ++s) {
-        const int i  = (s*nwarps*warp_size + tid) / T::blocks_per_row;
-        const int ib = (s*nwarps*warp_size + tid) % T::blocks_per_row;
+        const int i  = (s*nwarps*warp_size + tid) % nbatch_fa;
+        const int ib = (s*nwarps*warp_size + tid) / nbatch_fa;
         const bool odd = ib & 1;
 
         // Rows past the end were fetched as zeros: d = 0 gives zeros.
