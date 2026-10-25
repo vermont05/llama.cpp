@@ -10344,6 +10344,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, 1, 5120, {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
+        // K 6144 / 17408 past the 32 MB Infinity Cache, and the 2-column MTP verify at each K
+        for (int64_t n : {1, 2}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 40960, n, 6144, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 20480, n, 17408, {1, 1}, {1, 1}));
+        }
+        for (int64_t m : {17408, 69632}) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, 2, 5120, {1, 1}, {1, 1}));
+        }
     }
     // ... and prompt-sized (MMQ) at the same shapes
     for (ggml_type t : {GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0}) {

@@ -113,7 +113,11 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
 
 #define VDR_PQ2_0_Q8_1_MMVQ 1  // one 32-element chunk at a time (same per-chunk codec as Q2_0)
+#if defined(GGML_USE_HIP)
+#define VDR_PTQ1_0_Q8_1_MMVQ 2 // half a 128 block per lane: 40-block K rows fill 80 of 96 lanes instead of 40 of 64
+#else
 #define VDR_PTQ1_0_Q8_1_MMVQ 4 // whole 128 block per call: keeps the byte walk uniform across lanes
+#endif
 #define VDR_PQ2_0_Q8_1_MMQ  2  // Q2_0 group 128: 4 32-element chunks per block
 #define VDR_PTQ1_0_Q8_1_MMQ  2  // expanded to signed bytes in the MMQ tile loader
 
@@ -858,6 +862,101 @@ static constexpr bool ptq1_late_bias = true;
 static constexpr bool ptq1_late_bias = false;
 #endif
 
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+// HIP: two lanes per block, lane half h = iqs / 2. Half h takes qs dwords 2h, 2h+1 (40 trits each, 5 per byte),
+// qs dword 4 + h (20 trits) and qh step pair h (4 trits): 16 activation dwords and 16 dp4a, the same code on both
+// halves. Which q8_1 block a trit group lands in does not depend on h, so the sums stay in registers.
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __restrict__ vbq,
+                                                                 const block_q8_1 * __restrict__ bq8_1,
+                                                                 const int &    kbx,
+                                                                 const int &    iqs,
+                                                                 const uint32_t stride_col_y,
+                                                                 float *        result) {
+    const block_ptq1_0 * bq                 = (const block_ptq1_0 *) vbq + kbx;
+    const int            h                  = iqs >> 1;
+    int                  sumi[ncols_dst][4] = {};
+    int                  sumu[ncols_dst][4] = {}; // sum of the activations, for the late bias
+
+    // qs dwords 2h, 2h+1: trit t of byte 4g+b is weight 16t + 4g + b, activation dword 4t + g, q8_1 block t/2.
+#    pragma unroll
+    for (int gg = 0; gg < 2; ++gg) {
+        const int      g      = 2 * h + gg;
+        const uint32_t packed = get_int_b4(bq->qs, g);
+        uint32_t       v_lo   = ptq1_widen_lo(packed);
+        uint32_t       v_hi   = ptq1_widen_hi(packed);
+
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+
+            const int q = ptq1_trits4(w_lo, w_hi);
+#    pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u    = get_int_b4(bq8_1[j * stride_col_y + (t >> 1)].qs, 4 * (t & 1) + g);
+                sumi[j][t >> 1] = ggml_cuda_dp4a(q, u, sumi[j][t >> 1]);
+                sumu[j][t >> 1] = ggml_cuda_dp4a(0x01010101, u, sumu[j][t >> 1]);
+            }
+        }
+    }
+
+    // qs dword 4 + h: weight 80 + 8t + 4h + b, activation dword 20 + 2t + h, q8_1 block 2 for t < 2, else 3.
+    {
+        const uint32_t packed = get_int_b4(bq->qs, 4 + h);
+        uint32_t       v_lo   = ptq1_widen_lo(packed);
+        uint32_t       v_hi   = ptq1_widen_hi(packed);
+
+#    pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo                = w_lo & 0x00FF00FF;
+            v_hi                = w_hi & 0x00FF00FF;
+
+            const int q  = ptq1_trits4(w_lo, w_hi);
+            const int kb = t < 2 ? 2 : 3;
+#    pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u  = get_int_b4(bq8_1[j * stride_col_y + kb].qs, (20 + 2 * t + h) & 7);
+                sumi[j][kb] = ggml_cuda_dp4a(q, u, sumi[j][kb]);
+                sumu[j][kb] = ggml_cuda_dp4a(0x01010101, u, sumu[j][kb]);
+            }
+        }
+    }
+
+    // qh: byte b, trit t is weight 120 + 2t + b. Half h takes trits 2h, 2h+1 (activation dword 30 + h), so it
+    // starts from v * 3^(2h): v * 9 per 16-bit lane stays below 2^16.
+    {
+        const uint32_t v0 = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
+        uint32_t       v  = (v0 * (1 + 8 * h)) & 0x00FF00FF;
+        const uint32_t w0 = v * 3;
+        v                 = w0 & 0x00FF00FF;
+        const uint32_t w1 = v * 3;
+
+        const int q = ptq1_trits4(w0, w1);
+#    pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const int u = get_int_b4(bq8_1[j * stride_col_y + 3].qs, 6 + h);
+            sumi[j][3]  = ggml_cuda_dp4a(q, u, sumi[j][3]);
+            sumu[j][3]  = ggml_cuda_dp4a(0x01010101, u, sumu[j][3]);
+        }
+    }
+
+    const float d = (float) bq->d;
+#    pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        float acc = 0.0f;
+#    pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            acc += __low2float(bq8_1[j * stride_col_y + k].ds) * (float) (sumi[j][k] - sumu[j][k]);
+        }
+        result[j] = d * acc;
+    }
+}
+#else
 template <int ncols_dst>
 static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __restrict__ vbq,
                                                                  const block_q8_1 * __restrict__ bq8_1,
@@ -953,6 +1052,8 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
     }
 }
 
+#endif // HIP half-block
+
 // PTQ1_0 x Q8_1. One call consumes the full 128-weight block.
 static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restrict__ vbq,
                                                             const block_q8_1 * __restrict__ bq8_1,
@@ -969,6 +1070,9 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1_scalar(const void * 
                                                                    const block_q8_1 * __restrict__ bq8_1,
                                                                    const int & kbx,
                                                                    const int & iqs) {
+    if (iqs != 0) {
+        return 0.0f; // the whole block is done by the even lane of the pair (VDR_PTQ1_0_Q8_1_MMVQ 2)
+    }
     const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq + kbx;
     int                  sumi[4] = { 0, 0, 0, 0 };
 
