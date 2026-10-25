@@ -39,6 +39,8 @@ static __device__ __forceinline__ void conv_step_ab_row(const conv_step_ab_args 
     float sumf[2] = { 0.0f, 0.0f };
 #pragma unroll
     for (int v = 0; v < 2; ++v) {
+        // Unrolled so the loads are in flight together (the loop is 10 loads of latency otherwise); same FMA order.
+#pragma unroll 4
         for (int col2 = tid + v*128; col2 < ab.ncols2; col2 += block_size) {
             const int tmpx = x2[col2];
             const float2 tmpy = y2[col2];

@@ -2607,13 +2607,17 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        // GGML_CUDA_GRAPHS_DECODE_ONLY=1: graphs only for single-token graphs. Batches whose shape changes from step
-        // to step (speculative verification) would be re-captured every time, which costs more than graphs save.
-        static const bool decode_only = getenv("GGML_CUDA_GRAPHS_DECODE_ONLY") != nullptr;
+        // GGML_CUDA_GRAPHS_DECODE_ONLY=n: graphs only for graphs of at most n tokens (1 if the value is not a number).
+        // Batches whose shape changes from step to step (ngram verification) would be re-captured every time, which
+        // costs more than graphs save; the MTP verify is always 2 tokens, so n = 2 keeps it.
+        static const int decode_only = [] {
+            const char * v = getenv("GGML_CUDA_GRAPHS_DECODE_ONLY");
+            return v == nullptr ? 0 : std::max(1, atoi(v));
+        }();
         if (decode_only) {
             const bool multi_token =
-                (node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD && node->src[1]->ne[1] > 1) ||
-                (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0]->ne[1] > 1);
+                (node->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD && node->src[1]->ne[1] > decode_only) ||
+                (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0]->ne[1] > decode_only);
             if (multi_token) {
                 use_cuda_graph = false;
                 break;
