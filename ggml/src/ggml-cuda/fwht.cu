@@ -365,7 +365,8 @@ __global__ void fwht_rms_norm_block(const float * x, const float * w, float * no
 // fwht_cuda_block. The permuted row r of the output reads source head (i1*nb1 + i2*nb2)/(128*4).
 static __global__ void fwht_gated_norm_1024(
         const float * __restrict__ x, const float * __restrict__ gate, const float * __restrict__ w, const float eps,
-        const int ne1, const int64_t nb1, const int64_t nb2, const float scale, const float * __restrict__ signs,
+        const int ne1, const int ne2, const int64_t nb1, const int64_t nb2, const int64_t nb3, const float scale,
+        const float * __restrict__ signs,
         const int n_blk, float * __restrict__ dst, block_q8_1 * q8, const int ncols, float * dbg_out = nullptr) {
     constexpr int N = 1024, NT = 256, NE = N / NT, HD = 128, NH = N / HD;
     __shared__ float s[N];
@@ -381,8 +382,9 @@ static __global__ void fwht_gated_norm_1024(
     {
         const int ro = r*NH + warp;              // output (permuted) row
         const int i1 = ro % ne1;
-        const int i2 = ro / ne1;
-        const int h  = (i1*nb1 + i2*nb2) / (HD*int64_t(sizeof(float)));
+        const int i2 = (ro / ne1) % ne2;
+        const int i3 = ro / (ne1*ne2); // token
+        const int h  = (i1*nb1 + i2*nb2 + i3*nb3) / (HD*int64_t(sizeof(float)));
         const float * xr = x + int64_t(h)*HD;
         float part[4];
         {
@@ -509,7 +511,7 @@ bool ggml_cuda_op_gated_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_te
     }
     const int64_t rows = ggml_nelements(mm) / n;
     static const bool check = getenv("GGML_CUDA_GN_FWHT_CHECK") != nullptr;
-    if (check) {
+    if (check && x->ne[2] == 1) { // the debug buffers are laid out for one token
         // debug: compute into scratch and compare with the unfused result after it is produced (see check_node)
         static float * scratch = nullptr;
         if (!scratch) {
@@ -517,7 +519,7 @@ bool ggml_cuda_op_gated_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_te
         }
         fwht_gated_norm_1024<<<rows, 256, 0, ctx.stream()>>>(
             (const float *) x->data, (const float *) gate->data, (const float *) w->data, eps,
-            perm->ne[1], perm->nb[1], perm->nb[2], 1 / sqrtf(n), (const float *) signs->data, signs->ne[0] / n,
+            perm->ne[1], perm->ne[2], perm->nb[1], perm->nb[2], perm->nb[3], 1 / sqrtf(n), (const float *) signs->data, signs->ne[0] / n,
             scratch, nullptr, x->ne[0], scratch + ggml_nelements(mm));
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         ggml_cuda_gn_fwht_pending = { mm, scratch, (int) ggml_nelements(mm), cont_dbg, x };
@@ -526,7 +528,7 @@ bool ggml_cuda_op_gated_norm_fwht(ggml_backend_cuda_context & ctx, const ggml_te
     block_q8_1 * q8 = ggml_cuda_q8_1_cache_put(ctx, mm);
     fwht_gated_norm_1024<<<rows, 256, 0, ctx.stream()>>>(
         (const float *) x->data, (const float *) gate->data, (const float *) w->data, eps,
-        perm->ne[1], perm->nb[1], perm->nb[2], 1 / sqrtf(n), (const float *) signs->data, signs->ne[0] / n,
+        perm->ne[1], perm->ne[2], perm->nb[1], perm->nb[2], perm->nb[3], 1 / sqrtf(n), (const float *) signs->data, signs->ne[0] / n,
         (float *) mm->data, q8, x->ne[0]);
     CUDA_CHECK(cudaGetLastError());
     return true;

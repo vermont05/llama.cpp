@@ -12,11 +12,13 @@ static constexpr int gated_norm_block = 256;
 
 static __global__ void gated_norm_f32(
         const float * __restrict__ x, const float * __restrict__ gate, const float * __restrict__ w, float * __restrict__ dst,
-        const int ncols, const int ne1, const int64_t nb1, const int64_t nb2, const float eps) {
+        const int ncols, const int ne1, const int ne2, const int64_t nb1, const int64_t nb2, const int64_t nb3,
+        const float eps) {
     const int r   = blockIdx.x;
     const int i1  = r % ne1;
-    const int i2  = r / ne1;
-    const int h   = (i1*nb1 + i2*nb2) / (ncols*int64_t(sizeof(float))); // source row of output row r
+    const int i2  = (r / ne1) % ne2;
+    const int i3  = r / (ne1*ne2); // token
+    const int h   = (i1*nb1 + i2*nb2 + i3*nb3) / (ncols*int64_t(sizeof(float))); // source row of output row r
     const int tid = threadIdx.x;
 
     x    += int64_t(h)*ncols;
@@ -65,15 +67,17 @@ int ggml_cuda_try_fuse_gated_norm(ggml_backend_cuda_context & ctx, const ggml_cg
     const ggml_tensor * gate = glu->src[0] == mul ? glu->src[1] : glu->src[0];
     const bool ok =
         x->type == GGML_TYPE_F32 && ncols <= gated_norm_block && x->nb[0] == sizeof(float) && x->nb[1] == ncols*sizeof(float) &&
-        x->ne[2] == 1 && x->ne[3] == 1 &&
+        x->nb[2] == x->ne[1]*x->nb[1] && x->ne[3] == 1 &&
         (mul->src[0] == rn || mul->src[1] == rn) && w->type == GGML_TYPE_F32 && ggml_nelements(w) == ncols && ggml_is_contiguous(w) &&
         ggml_are_same_shape(mul, rn) &&
         gate->type == GGML_TYPE_F32 && ggml_are_same_shape(gate, rn) && ggml_is_contiguous(gate) &&
         glu->src[0] == gate && glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) &&
         r1->src[0] == glu && r2->src[0] == r1 && perm->src[0] == r2 && cont->src[0] == perm &&
-        perm->ne[0] == ncols && perm->nb[0] == sizeof(float) && perm->ne[3] == 1 &&
+        perm->ne[0] == ncols && perm->nb[0] == sizeof(float) &&
         perm->nb[1] % (ncols*sizeof(float)) == 0 && perm->nb[2] % (ncols*sizeof(float)) == 0 &&
-        perm->ne[1]*perm->ne[2] == x->ne[1] &&
+        perm->nb[3] % (ncols*sizeof(float)) == 0 &&
+        // the permutation stays inside each token's heads (prompts: one token per perm->ne[3] index)
+        perm->ne[1]*perm->ne[2] == x->ne[1] && perm->ne[3] == x->ne[2] && perm->nb[3] == x->nb[2] &&
         cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont);
     if (!ok) {
         return 0;
@@ -109,9 +113,9 @@ int ggml_cuda_try_fuse_gated_norm(ggml_backend_cuda_context & ctx, const ggml_cg
         }
     }
 
-    gated_norm_f32<<<perm->ne[1]*perm->ne[2], gated_norm_block, 0, ctx.stream()>>>(
+    gated_norm_f32<<<perm->ne[1]*perm->ne[2]*perm->ne[3], gated_norm_block, 0, ctx.stream()>>>(
         (const float *) x->data, (const float *) gate->data, (const float *) w->data, (float *) cont->data,
-        ncols, perm->ne[1], perm->nb[1], perm->nb[2], eps);
+        ncols, perm->ne[1], perm->ne[2], perm->nb[1], perm->nb[2], perm->nb[3], eps);
     CUDA_CHECK(cudaGetLastError());
     return 6;
 }
