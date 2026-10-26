@@ -718,6 +718,40 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// One block per (Q tile, sequence, FATTN_KQ_STRIDE chunk of KV): if any mask value of the chunk is not 0, KV_nomask
+// becomes at least (number of chunks - chunk index). The kernel can then skip the mask for all KV before
+// ne11 - KV_nomask*FATTN_KQ_STRIDE: adding a 0 mask (times any ALiBi slope) changes nothing. KV_nomask must be zeroed first.
+template <int ncols1>
+__launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+static __global__ void flash_attn_mask_to_KV_nomask(
+        const half2 * mask_ptr, int * KV_nomask_ptr, const int ne31, const int64_t s31, const int64_t s33) {
+    const half2 * GGML_CUDA_RESTRICT mask      = mask_ptr;
+    int         * GGML_CUDA_RESTRICT KV_nomask = KV_nomask_ptr;
+
+    const int tid      = threadIdx.x;
+    const int jt       = blockIdx.x;
+    const int sequence = blockIdx.y;
+    const int chunk    = blockIdx.z;
+
+    mask += sequence*s33 + jt*ncols1*s31 + chunk*(FATTN_KQ_STRIDE/2);
+
+    ggml_cuda_pdl_sync();
+
+    int any_nonzero = 0;
+#pragma unroll
+    for (int j = 0; j < ncols1; ++j) {
+        if (jt*ncols1 + j < ne31) { // Rows past the mask are not used.
+            const float2 tmp = __half22float2(mask[j*s31 + tid]);
+            any_nonzero = any_nonzero || tmp.x != 0.0f || tmp.y != 0.0f;
+        }
+    }
+    any_nonzero = __syncthreads_or(any_nonzero);
+
+    if (tid == 0 && any_nonzero) {
+        atomicMax(KV_nomask + sequence*gridDim.x + jt, int(gridDim.z) - chunk);
+    }
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -972,7 +1006,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool need_KV_nomask = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1091,7 +1126,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (need_KV_nomask || Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1101,11 +1136,22 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
+        KV_max.alloc(need_KV_nomask ? 2*ne_KV_max : ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
+
+        if (need_KV_nomask) {
+            // Stored after the KV_max values, see flash_attn_mask_to_KV_nomask.
+            CUDA_CHECK(cudaMemsetAsync(KV_max.ptr + ne_KV_max, 0, ne_KV_max*sizeof(int), main_stream));
+            const dim3 blocks_num_KV_nomask(ntiles_x, Q->ne[3], iter_k);
+            ggml_cuda_kernel_launch_params launch_params_nomask =
+                ggml_cuda_kernel_launch_params(blocks_num_KV_nomask, block_dim_KV_max, 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_nomask<ncols1>, launch_params_nomask,
+                (const half2 *) mask->data, KV_max.ptr + ne_KV_max, int(mask->ne[1]), s31, s33);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
