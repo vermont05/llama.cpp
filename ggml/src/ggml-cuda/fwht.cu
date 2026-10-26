@@ -295,6 +295,111 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
     fwht_block_finish<N, NT>(reg, s, r, dst, q8);
 }
 
+// swiglu(gate, up) = silu(gate)*up, then sign flip + FWHT of it, one block per N-wide row: the FFN gate before
+// ffn_down without writing and re-reading the swiglu output. The arithmetic is that of unary_gated_op_kernel<op_silu>
+// followed by fwht_cuda_block<N, NT, float, true>.
+// dst may share memory with gate or up: the allocator frees them after the swiglu, and in prompts it places the FWHT
+// output a few thousand rows before gate. A block reads its row before writing it, so dst == gate (or up) is safe as
+// is. When dst row r lies on input row r - k (k > 0, the k_* arguments), blocks take rows in start order from a ticket
+// counter, flag their row once its inputs are read, and wait for the flag of row r - k before writing: that row
+// belongs to an earlier, already running block, so the wait always ends.
+template <int N, int NT>
+__launch_bounds__(NT, 1)
+__global__ void fwht_swiglu_block(const float * gate, const float * up, float * dst, const int64_t n_rows, const float scale,
+                                  const float * signs, const int n_blk, block_q8_1 * q8, int * order,
+                                  const int64_t k_gate, const int64_t k_up) {
+    constexpr int NE = N / NT;
+
+    __shared__ float s[N];
+    __shared__ int64_t s_r;
+
+    const int tid = threadIdx.x;
+    int64_t r = blockIdx.x;
+    if (order) {
+        if (tid == 0) {
+            s_r = atomicAdd((unsigned int *) order, 1u);
+        }
+        __syncthreads();
+        r = s_r;
+    }
+    if (r >= n_rows) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float * signs_row = signs + (r % n_blk) * N;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const float y = ggml_cuda_op_silu_single(gate[r * N + i * NT + tid]) * up[r * N + i * NT + tid];
+        reg[i] = y * scale;
+        reg[i] *= signs_row[i * NT + tid];
+    }
+
+    if (order) {
+        __syncthreads(); // every thread has its inputs
+        if (tid == 0) {
+            __threadfence();
+            atomicExch(order + 1 + r, 1);
+            if (k_gate > 0 && r >= k_gate) {
+                while (atomicAdd(order + 1 + r - k_gate, 0) == 0) {}
+            }
+            if (k_up > 0 && r >= k_up) {
+                while (atomicAdd(order + 1 + r - k_up, 0) == 0) {}
+            }
+            __threadfence();
+        }
+        __syncthreads();
+    }
+
+    fwht_block_finish<N, NT>(reg, s, r, dst, q8);
+}
+
+bool ggml_cuda_op_swiglu_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
+                              const ggml_tensor * signs, ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_CUDA_NO_SWIGLU_FWHT") != nullptr;
+    constexpr int N = 1024;
+    if (disabled || dst->ne[0] != N || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) ||
+            ggml_nelements(gate) != ggml_nelements(dst) || ggml_nelements(up) != ggml_nelements(dst) ||
+            signs->type != GGML_TYPE_F32 || !ggml_is_contiguous(signs) || signs->ne[0] % N != 0 ||
+            gate->ne[0] % N != 0) {
+        return false;
+    }
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    // rows by which dst runs ahead of an input it overlaps: 0 = none (or the same buffer), -1 = not supported
+    auto lead = [&](const ggml_tensor * src) -> int64_t {
+        if (!overlaps(dst, src) || dst->data == src->data) {
+            return 0;
+        }
+        const int64_t d = (const char *) src->data - (const char *) dst->data;
+        return d > 0 && d % (N*sizeof(float)) == 0 ? d / int64_t(N*sizeof(float)) : -1;
+    };
+    const int64_t k_gate = lead(gate);
+    const int64_t k_up   = lead(up);
+    if (k_gate < 0 || k_up < 0 || overlaps(dst, signs)) {
+        return false;
+    }
+    const int64_t rows = ggml_nelements(dst) / N;
+    block_q8_1 * q8 = ggml_cuda_q8_1_cache_put(ctx, dst);
+    int * order = nullptr;
+    ggml_cuda_pool_alloc<int> order_buf(ctx.pool());
+    if (k_gate > 0 || k_up > 0) {
+        order = order_buf.alloc(rows + 1);
+        CUDA_CHECK(cudaMemsetAsync(order, 0, (rows + 1)*sizeof(int), ctx.stream()));
+    }
+    fwht_swiglu_block<N, FWHT_BLOCK_THREADS><<<rows, FWHT_BLOCK_THREADS, 0, ctx.stream()>>>(
+        (const float *) gate->data, (const float *) up->data, (float *) dst->data, rows, 1 / sqrtf(N),
+        (const float *) signs->data, signs->ne[0] / N, q8, order, k_gate, k_up);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // rms_norm * weight -> norm_dst, then sign flip + FWHT of it, one block per N-wide chunk of a row.
 // Each block reads the full row for the norm sum and writes only its own chunk.
 template <int N, int NT>

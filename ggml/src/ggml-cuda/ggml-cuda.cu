@@ -3654,6 +3654,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // SWIGLU(gate, up) + the sign flip + reshape + FWHT-hint matmul that follow it: one kernel
+    if (cgraph->nodes[i]->op == GGML_OP_GLU && ggml_get_glu_op(cgraph->nodes[i]) == GGML_GLU_OP_SWIGLU &&
+            cgraph->nodes[i]->src[1] != nullptr &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 3 })) {
+        const ggml_tensor * glu     = cgraph->nodes[i];
+        const ggml_tensor * mul     = cgraph->nodes[i + 1];
+        const ggml_tensor * reshape = cgraph->nodes[i + 2];
+        ggml_tensor *       mm      = cgraph->nodes[i + 3];
+        const ggml_tensor * signs   = mul->src[1];
+        if (ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD && mm->src[1] == reshape && reshape->src[0] == mul &&
+                mul->src[0] == glu && glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) &&
+                ggml_are_same_shape(glu, glu->src[0]) && ggml_are_same_shape(glu, glu->src[1]) &&
+                signs->ne[0] == glu->ne[0] && ggml_nrows(signs) == 1 &&
+                ggml_cuda_op_swiglu_fwht(*cuda_ctx, glu->src[0], glu->src[1], signs, mm)) {
+            return 3;
+        }
+    }
+
     // Hadamard sign flip + reshape + FWHT-hint matmul: multiply the sign
     // vector during the transform's load instead of a separate full pass
     if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {

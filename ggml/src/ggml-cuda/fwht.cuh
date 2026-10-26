@@ -19,3 +19,7 @@ struct gn_fwht_pending { const ggml_tensor * mm = nullptr; float * scratch = nul
 extern gn_fwht_pending ggml_cuda_gn_fwht_pending;
 void ggml_cuda_gn_fwht_check(ggml_backend_cuda_context & ctx);
 void ggml_cuda_gn_fwht_check_pre(ggml_backend_cuda_context & ctx);
+
+// SWIGLU(gate, up) -> MUL(signs) -> RESHAPE -> FWHT-hint MUL_MAT as one kernel (the FFN gate before ffn_down).
+bool ggml_cuda_op_swiglu_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
+                              const ggml_tensor * signs, ggml_tensor * dst);
