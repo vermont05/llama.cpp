@@ -204,3 +204,121 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// CONCAT(conv state, qkv^T) -> SSM_CONV -> SILU plus the conv state update, in one pass. The concat writes a transposed
+// copy of qkv (strided reads, a full extra round trip); here one thread per channel walks all tokens and reads qkv in
+// its own channel-fastest layout, so every load and store is coalesced across the warp. The graph allocator may give
+// the output the qkv buffer (qkv is dead after the concat): each thread reads a group of tokens before it writes them,
+// and the new state comes from its window, so that in-place case is safe.
+template <int d_conv, int unroll>
+static __global__ void ssm_conv_concat_silu_f32(
+        const float * __restrict__ state, const float * x, const float * __restrict__ w,
+        float * y, float * __restrict__ state_out, const int C, const int n_t,
+        const int64_t s_c, const int64_t s_s, const int64_t x_t, const int64_t x_s, const int64_t w_c,
+        const int64_t y_t, const int64_t y_s, const int64_t so_s) {
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    const int s = blockIdx.y;
+    if (c >= C) {
+        return;
+    }
+
+    const float * st = state + s*s_s + c*s_c;
+    const float * xs = x + s*x_s + c;
+    float *       ys = y + s*y_s + c;
+
+    float wc[d_conv];
+    float win[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wc[j] = w[c*w_c + j];
+    }
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; ++j) {
+        win[j] = st[j];
+    }
+
+    for (int t0 = 0; t0 < n_t; t0 += unroll) {
+        float xv[unroll];
+#pragma unroll
+        for (int u = 0; u < unroll; ++u) {
+            xv[u] = t0 + u < n_t ? xs[(int64_t) (t0 + u)*x_t] : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < unroll; ++u) {
+            if (t0 + u < n_t) {
+                win[d_conv - 1] = xv[u];
+                float sumf = 0.0f;
+#pragma unroll
+                for (int j = 0; j < d_conv; ++j) {
+                    sumf += win[j]*wc[j];
+                }
+                ys[(int64_t) (t0 + u)*y_t] = ggml_cuda_op_silu_single(sumf);
+#pragma unroll
+                for (int j = 0; j < d_conv - 1; ++j) {
+                    win[j] = win[j + 1];
+                }
+            }
+        }
+    }
+
+    // the last d_conv-1 concat columns become the new state
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; ++j) {
+        state_out[s*so_s + c*(d_conv - 1) + j] = win[j];
+    }
+}
+
+static bool ssm_conv_concat_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+    const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+bool ggml_cuda_ssm_conv_concat_supported(const ggml_tensor * concat, const ggml_tensor * cpy, const ggml_tensor * ssm_conv,
+                                         const ggml_tensor * silu) {
+    const ggml_tensor * state     = concat->src[0];
+    const ggml_tensor * x         = concat->src[1];
+    const ggml_tensor * w         = ssm_conv->src[1];
+    const ggml_tensor * state_out = cpy->src[1];
+    const int64_t C   = state->ne[1];
+    const int64_t n_s = state->ne[2];
+    const bool shapes =
+        ggml_get_op_params_i32(concat, 0) == 0 && w->ne[0] == 4 && state->ne[0] == w->ne[0] - 1 &&
+        state->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        silu->type == GGML_TYPE_F32 && state_out->type == GGML_TYPE_F32 &&
+        state->nb[0] == sizeof(float) && x->nb[1] == sizeof(float) && w->nb[0] == sizeof(float) &&
+        x->ne[1] == C && x->ne[2] == n_s && w->ne[1] == C && state->ne[3] == 1 && x->ne[3] == 1 &&
+        silu->ne[0] == C && silu->ne[1] == x->ne[0] && silu->ne[2] == n_s && silu->nb[0] == sizeof(float) &&
+        // the state update: CPY of the last d_conv-1 concat columns into a contiguous [(d_conv-1)*C, n_s] cache view
+        state_out->ne[0] == state->ne[0]*C && ggml_nrows(state_out) == n_s && state_out->nb[0] == sizeof(float) &&
+        C <= INT_MAX && x->ne[0] <= INT_MAX;
+    if (!shapes) {
+        return false;
+    }
+    // The output may be exactly the qkv buffer (element for element), nothing else may overlap.
+    const bool y_is_x = silu->data == x->data && silu->nb[1] == x->nb[0] && silu->nb[2] == x->nb[2];
+    return (y_is_x || !ssm_conv_concat_overlaps(silu, x)) && !ssm_conv_concat_overlaps(silu, state) &&
+        !ssm_conv_concat_overlaps(silu, w) && !ssm_conv_concat_overlaps(silu, state_out) &&
+        !ssm_conv_concat_overlaps(state_out, state) && !ssm_conv_concat_overlaps(state_out, x) &&
+        !ssm_conv_concat_overlaps(state_out, w);
+}
+
+void ggml_cuda_op_ssm_conv_concat(ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * cpy,
+                                  ggml_tensor * ssm_conv, ggml_tensor * silu) {
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * x     = concat->src[1];
+    const ggml_tensor * w     = ssm_conv->src[1];
+    ggml_tensor * state_out   = cpy->src[1];
+
+    const int C   = (int) state->ne[1];
+    const int n_t = (int) x->ne[0];
+    const int n_s = (int) state->ne[2];
+
+    constexpr int threads = 64;
+    const dim3 blocks((C + threads - 1)/threads, n_s);
+    ssm_conv_concat_silu_f32<4, 8><<<blocks, threads, 0, ctx.stream()>>>(
+        (const float *) state->data, (const float *) x->data, (const float *) w->data, (float *) silu->data,
+        (float *) state_out->data, C, n_t,
+        state->nb[1]/sizeof(float), state->nb[2]/sizeof(float), x->nb[0]/sizeof(float), x->nb[2]/sizeof(float),
+        w->nb[1]/sizeof(float), silu->nb[1]/sizeof(float), silu->nb[2]/sizeof(float), state_out->nb[1]/sizeof(float));
+}

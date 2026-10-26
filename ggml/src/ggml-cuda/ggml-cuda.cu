@@ -3441,6 +3441,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (disable_fusion) {
         return 0;
     }
+
+    // Gated DeltaNet conv (build_conv_state + ggml_ssm_conv + ggml_silu):
+    // CONCAT(state, qkv^T), VIEW(last columns of the concat), VIEW(cache), CPY(last -> cache), SSM_CONV(concat), SILU.
+    static const bool conv_concat_disabled = getenv("GGML_CUDA_NO_CONV_CONCAT") != nullptr;
+    if (!conv_concat_disabled && cgraph->nodes[i]->op == GGML_OP_CONCAT && i + 5 < cgraph->n_nodes) {
+        ggml_tensor * concat = cgraph->nodes[i];
+        ggml_tensor * last   = cgraph->nodes[i + 1];
+        ggml_tensor * cache  = cgraph->nodes[i + 2];
+        ggml_tensor * cpy    = cgraph->nodes[i + 3];
+        ggml_tensor * conv   = cgraph->nodes[i + 4];
+        ggml_tensor * silu   = cgraph->nodes[i + 5];
+        const ggml_tensor * state = concat->src[0];
+        if (last->op == GGML_OP_VIEW && last->view_src == concat && cache->op == GGML_OP_VIEW &&
+                cpy->op == GGML_OP_CPY && cpy->src[0] == last && cpy->src[1] == cache &&
+                conv->op == GGML_OP_SSM_CONV && conv->src[0] == concat &&
+                silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == conv &&
+                ggml_node_get_use_count(cgraph, i) == 2 && ggml_node_get_use_count(cgraph, i + 4) == 1 &&
+                !(concat->flags & GGML_TENSOR_FLAG_OUTPUT) && !(conv->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                last->view_offs == (size_t) (concat->ne[0] - state->ne[0])*sizeof(float) &&
+                last->ne[0] == state->ne[0] && last->ne[1] == state->ne[1] && last->ne[2] == state->ne[2] &&
+                last->nb[1] == concat->nb[1] && last->nb[2] == concat->nb[2] &&
+                ggml_cuda_ssm_conv_concat_supported(concat, cpy, conv, silu)) {
+            ggml_cuda_op_ssm_conv_concat(*cuda_ctx, concat, cpy, conv, silu);
+            return 5;
+        }
+    }
     static const bool dual_rms_q8_enabled = [] {
         const char * env = getenv("GGML_CUDA_GB10_DUAL_RMS_Q8");
         return !env || std::atoi(env) != 0;
