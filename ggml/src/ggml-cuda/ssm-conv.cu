@@ -213,7 +213,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 template <int d_conv, int unroll>
 static __global__ void ssm_conv_concat_silu_f32(
         const float * __restrict__ state, const float * x, const float * __restrict__ w,
-        float * y, float * __restrict__ state_out, const int C, const int n_t,
+        float * y, const ssm_conv_concat_snaps snaps, const int C, const int n_t,
         const int64_t s_c, const int64_t s_s, const int64_t x_t, const int64_t x_s, const int64_t w_c,
         const int64_t y_t, const int64_t y_s, const int64_t so_s) {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
@@ -225,6 +225,16 @@ static __global__ void ssm_conv_concat_silu_f32(
     const float * st = state + s*s_s + c*s_c;
     const float * xs = x + s*x_s + c;
     float *       ys = y + s*y_s + c;
+
+    // State snapshots (d_conv-1 concat columns from snaps.col[k]) are copied first: this thread owns its channel, so
+    // nothing has been overwritten yet when y is the qkv buffer. One snapshot normally, n_rs_seq+1 with MTP rollback.
+    for (int k = 0; k < snaps.n; ++k) {
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            const int col = snaps.col[k] + j;
+            snaps.dst[k][s*so_s + c*(d_conv - 1) + j] = col < d_conv - 1 ? st[col] : xs[(int64_t) (col - (d_conv - 1))*x_t];
+        }
+    }
 
     float wc[d_conv];
     float win[d_conv];
@@ -260,12 +270,6 @@ static __global__ void ssm_conv_concat_silu_f32(
             }
         }
     }
-
-    // the last d_conv-1 concat columns become the new state
-#pragma unroll
-    for (int j = 0; j < d_conv - 1; ++j) {
-        state_out[s*so_s + c*(d_conv - 1) + j] = win[j];
-    }
 }
 
 static bool ssm_conv_concat_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
@@ -274,51 +278,71 @@ static bool ssm_conv_concat_overlaps(const ggml_tensor * a, const ggml_tensor * 
     return a0 < b1 && b0 < a1;
 }
 
-bool ggml_cuda_ssm_conv_concat_supported(const ggml_tensor * concat, const ggml_tensor * cpy, const ggml_tensor * ssm_conv,
-                                         const ggml_tensor * silu) {
-    const ggml_tensor * state     = concat->src[0];
-    const ggml_tensor * x         = concat->src[1];
-    const ggml_tensor * w         = ssm_conv->src[1];
-    const ggml_tensor * state_out = cpy->src[1];
+bool ggml_cuda_ssm_conv_concat_supported(const ggml_tensor * concat, ggml_tensor * const * cpys, const int n_cpy,
+                                         const ggml_tensor * ssm_conv, const ggml_tensor * silu) {
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * x     = concat->src[1];
+    const ggml_tensor * w     = ssm_conv->src[1];
     const int64_t C   = state->ne[1];
     const int64_t n_s = state->ne[2];
     const bool shapes =
+        n_cpy >= 1 && n_cpy <= SSM_CONV_CONCAT_MAX_SNAPS &&
         ggml_get_op_params_i32(concat, 0) == 0 && w->ne[0] == 4 && state->ne[0] == w->ne[0] - 1 &&
         state->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
-        silu->type == GGML_TYPE_F32 && state_out->type == GGML_TYPE_F32 &&
+        silu->type == GGML_TYPE_F32 &&
         state->nb[0] == sizeof(float) && x->nb[1] == sizeof(float) && w->nb[0] == sizeof(float) &&
         x->ne[1] == C && x->ne[2] == n_s && w->ne[1] == C && state->ne[3] == 1 && x->ne[3] == 1 &&
         silu->ne[0] == C && silu->ne[1] == x->ne[0] && silu->ne[2] == n_s && silu->nb[0] == sizeof(float) &&
-        // the state update: CPY of the last d_conv-1 concat columns into a contiguous [(d_conv-1)*C, n_s] cache view
-        state_out->ne[0] == state->ne[0]*C && ggml_nrows(state_out) == n_s && state_out->nb[0] == sizeof(float) &&
         C <= INT_MAX && x->ne[0] <= INT_MAX;
     if (!shapes) {
         return false;
     }
     // The output may be exactly the qkv buffer (element for element), nothing else may overlap.
     const bool y_is_x = silu->data == x->data && silu->nb[1] == x->nb[0] && silu->nb[2] == x->nb[2];
-    return (y_is_x || !ssm_conv_concat_overlaps(silu, x)) && !ssm_conv_concat_overlaps(silu, state) &&
-        !ssm_conv_concat_overlaps(silu, w) && !ssm_conv_concat_overlaps(silu, state_out) &&
-        !ssm_conv_concat_overlaps(state_out, state) && !ssm_conv_concat_overlaps(state_out, x) &&
-        !ssm_conv_concat_overlaps(state_out, w);
+    if (!(y_is_x || !ssm_conv_concat_overlaps(silu, x)) || ssm_conv_concat_overlaps(silu, state) ||
+            ssm_conv_concat_overlaps(silu, w)) {
+        return false;
+    }
+    for (int k = 0; k < n_cpy; ++k) {
+        // each state update: CPY of d_conv-1 concat columns into a contiguous [(d_conv-1)*C, n_s] cache view
+        const ggml_tensor * state_out = cpys[k]->src[1];
+        if (state_out->type != GGML_TYPE_F32 || state_out->ne[0] != state->ne[0]*C || ggml_nrows(state_out) != n_s ||
+                state_out->nb[0] != sizeof(float) || state_out->nb[1] != cpys[0]->src[1]->nb[1] ||
+                ssm_conv_concat_overlaps(silu, state_out) || ssm_conv_concat_overlaps(state_out, state) ||
+                ssm_conv_concat_overlaps(state_out, x) || ssm_conv_concat_overlaps(state_out, w)) {
+            return false;
+        }
+        for (int k2 = 0; k2 < k; ++k2) {
+            if (ssm_conv_concat_overlaps(state_out, cpys[k2]->src[1])) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
-void ggml_cuda_op_ssm_conv_concat(ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * cpy,
-                                  ggml_tensor * ssm_conv, ggml_tensor * silu) {
+void ggml_cuda_op_ssm_conv_concat(ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * const * cpys,
+                                  const int n_cpy, ggml_tensor * ssm_conv, ggml_tensor * silu) {
     const ggml_tensor * state = concat->src[0];
     const ggml_tensor * x     = concat->src[1];
     const ggml_tensor * w     = ssm_conv->src[1];
-    ggml_tensor * state_out   = cpy->src[1];
 
     const int C   = (int) state->ne[1];
     const int n_t = (int) x->ne[0];
     const int n_s = (int) state->ne[2];
 
+    ssm_conv_concat_snaps snaps = {};
+    snaps.n = n_cpy;
+    for (int k = 0; k < n_cpy; ++k) {
+        snaps.dst[k] = (float *) cpys[k]->src[1]->data;
+        snaps.col[k] = (int) (cpys[k]->src[0]->view_offs/sizeof(float));
+    }
+
     constexpr int threads = 64;
     const dim3 blocks((C + threads - 1)/threads, n_s);
     ssm_conv_concat_silu_f32<4, 8><<<blocks, threads, 0, ctx.stream()>>>(
         (const float *) state->data, (const float *) x->data, (const float *) w->data, (float *) silu->data,
-        (float *) state_out->data, C, n_t,
+        snaps, C, n_t,
         state->nb[1]/sizeof(float), state->nb[2]/sizeof(float), x->nb[0]/sizeof(float), x->nb[2]/sizeof(float),
-        w->nb[1]/sizeof(float), silu->nb[1]/sizeof(float), silu->nb[2]/sizeof(float), state_out->nb[1]/sizeof(float));
+        w->nb[1]/sizeof(float), silu->nb[1]/sizeof(float), silu->nb[2]/sizeof(float), cpys[0]->src[1]->nb[1]/sizeof(float));
 }

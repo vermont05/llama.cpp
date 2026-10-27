@@ -3443,28 +3443,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // Gated DeltaNet conv (build_conv_state + ggml_ssm_conv + ggml_silu):
-    // CONCAT(state, qkv^T), VIEW(last columns of the concat), VIEW(cache), CPY(last -> cache), SSM_CONV(concat), SILU.
+    // CONCAT(state, qkv^T), then per state snapshot VIEW(columns of the concat), VIEW(cache), CPY(columns -> cache)
+    // (one snapshot normally, n_rs_seq+1 with MTP rollback), then SSM_CONV(concat), SILU.
     static const bool conv_concat_disabled = getenv("GGML_CUDA_NO_CONV_CONCAT") != nullptr;
-    if (!conv_concat_disabled && cgraph->nodes[i]->op == GGML_OP_CONCAT && i + 5 < cgraph->n_nodes) {
+    if (!conv_concat_disabled && cgraph->nodes[i]->op == GGML_OP_CONCAT) {
         ggml_tensor * concat = cgraph->nodes[i];
-        ggml_tensor * last   = cgraph->nodes[i + 1];
-        ggml_tensor * cache  = cgraph->nodes[i + 2];
-        ggml_tensor * cpy    = cgraph->nodes[i + 3];
-        ggml_tensor * conv   = cgraph->nodes[i + 4];
-        ggml_tensor * silu   = cgraph->nodes[i + 5];
         const ggml_tensor * state = concat->src[0];
-        if (last->op == GGML_OP_VIEW && last->view_src == concat && cache->op == GGML_OP_VIEW &&
-                cpy->op == GGML_OP_CPY && cpy->src[0] == last && cpy->src[1] == cache &&
-                conv->op == GGML_OP_SSM_CONV && conv->src[0] == concat &&
-                silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == conv &&
-                ggml_node_get_use_count(cgraph, i) == 2 && ggml_node_get_use_count(cgraph, i + 4) == 1 &&
-                !(concat->flags & GGML_TENSOR_FLAG_OUTPUT) && !(conv->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                last->view_offs == (size_t) (concat->ne[0] - state->ne[0])*sizeof(float) &&
-                last->ne[0] == state->ne[0] && last->ne[1] == state->ne[1] && last->ne[2] == state->ne[2] &&
-                last->nb[1] == concat->nb[1] && last->nb[2] == concat->nb[2] &&
-                ggml_cuda_ssm_conv_concat_supported(concat, cpy, conv, silu)) {
-            ggml_cuda_op_ssm_conv_concat(*cuda_ctx, concat, cpy, conv, silu);
-            return 5;
+        ggml_tensor * cpys[SSM_CONV_CONCAT_MAX_SNAPS];
+        int n_cpy = 0;
+        int j = i + 1;
+        while (n_cpy < SSM_CONV_CONCAT_MAX_SNAPS && j + 2 < cgraph->n_nodes) {
+            ggml_tensor * last  = cgraph->nodes[j];
+            ggml_tensor * cache = cgraph->nodes[j + 1];
+            ggml_tensor * cpy   = cgraph->nodes[j + 2];
+            if (!(last->op == GGML_OP_VIEW && last->view_src == concat && cache->op == GGML_OP_VIEW &&
+                    cpy->op == GGML_OP_CPY && cpy->src[0] == last && cpy->src[1] == cache &&
+                    last->view_offs % sizeof(float) == 0 &&
+                    last->view_offs <= (size_t) (concat->ne[0] - state->ne[0])*sizeof(float) &&
+                    last->ne[0] == state->ne[0] && last->ne[1] == state->ne[1] && last->ne[2] == state->ne[2] &&
+                    last->nb[1] == concat->nb[1] && last->nb[2] == concat->nb[2])) {
+                break;
+            }
+            cpys[n_cpy++] = cpy;
+            j += 3;
+        }
+        if (n_cpy > 0 && j + 1 < cgraph->n_nodes) {
+            ggml_tensor * conv = cgraph->nodes[j];
+            ggml_tensor * silu = cgraph->nodes[j + 1];
+            if (conv->op == GGML_OP_SSM_CONV && conv->src[0] == concat &&
+                    silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == conv &&
+                    ggml_node_get_use_count(cgraph, i) == n_cpy + 1 && ggml_node_get_use_count(cgraph, j) == 1 &&
+                    !(concat->flags & GGML_TENSOR_FLAG_OUTPUT) && !(conv->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    ggml_cuda_ssm_conv_concat_supported(concat, cpys, n_cpy, conv, silu)) {
+                ggml_cuda_op_ssm_conv_concat(*cuda_ctx, concat, cpys, n_cpy, conv, silu);
+                return j + 1 - i;
+            }
         }
     }
     static const bool dual_rms_q8_enabled = [] {
