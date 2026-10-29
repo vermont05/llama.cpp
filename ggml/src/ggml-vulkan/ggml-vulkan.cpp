@@ -1563,6 +1563,9 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t state_mode;
+    uint32_t state_row_stride;
+    uint32_t state_out_off;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -1980,6 +1983,17 @@ struct ggml_backend_vk_context {
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
+
+    // GATED_DELTA_NET nodes that read and write their recurrent state directly in the cache (found per graph by
+    // ggml_vk_find_gdn_inplace), and the GET_ROWS / CPY nodes that this makes redundant.
+    struct gdn_inplace_info {
+        const ggml_tensor * states;     // cache rows the state is gathered from (GET_ROWS src0)
+        const ggml_tensor * ids;        // row index (GET_ROWS src1)
+        const ggml_tensor * state_dst;  // cache view the new state is copied to (CPY dst)
+    };
+    std::unordered_map<const ggml_tensor *, gdn_inplace_info> gdn_inplace;
+    std::set<const ggml_tensor *> skip_nodes;
+    uint64_t gdn_inplace_key {};
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
@@ -5204,7 +5218,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
         }
@@ -11419,6 +11433,21 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t neq1 = (uint32_t)src_q->ne[1];
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
+    // binding 7 is only read in the in-place mode; bind any valid buffer otherwise
+    vk_subbuffer ids_buf = src_buf[4];
+    uint32_t state_mode = 0, state_row_stride = 0, state_out_off = 0;
+    auto inplace = ctx->gdn_inplace.find(dst);
+    if (inplace != ctx->gdn_inplace.end()) {
+        const vk_subbuffer states_buf = ggml_vk_tensor_subbuffer(ctx, inplace->second.states);
+        const vk_subbuffer out_buf    = ggml_vk_tensor_subbuffer(ctx, inplace->second.state_dst);
+        GGML_ASSERT(states_buf.buffer == out_buf.buffer && out_buf.offset >= states_buf.offset);
+        src_buf[5]       = states_buf;
+        ids_buf          = ggml_vk_tensor_subbuffer(ctx, inplace->second.ids);
+        state_mode       = 1;
+        state_row_stride = (uint32_t)(inplace->second.states->nb[1] / sizeof(float));
+        state_out_off    = (uint32_t)((out_buf.offset - states_buf.offset) / sizeof(float));
+    }
+
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
@@ -11427,11 +11456,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        state_mode, state_row_stride, state_out_off
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, ids_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -13805,6 +13835,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return false;
     }
+    if (ctx->skip_nodes.count(node)) {
+        return false;
+    }
 
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
     ctx->semaphore_idx = 0;
@@ -13890,6 +13923,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             }
         }
 
+        // An in-place GDN reads and writes cache memory that is not among its srcs/dst: always sync before it.
+        const auto gdn_inplace = node->op == GGML_OP_GATED_DELTA_NET ? ctx->gdn_inplace.find(node) : ctx->gdn_inplace.end();
+        if (gdn_inplace != ctx->gdn_inplace.end()) {
+            need_sync = true;
+        }
+
         if (need_sync) {
             if (vk_enable_sync_logger) {
                 std::cerr <<  "sync" << std::endl;
@@ -13917,6 +13956,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                 }
                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
             }
+        }
+        if (gdn_inplace != ctx->gdn_inplace.end()) {
+            ctx->unsynced_nodes_read.push_back(gdn_inplace->second.states);
+            ctx->unsynced_nodes_read.push_back(gdn_inplace->second.ids);
+            ctx->unsynced_nodes_written.push_back(gdn_inplace->second.state_dst);
         }
     }
     if (vk_enable_sync_logger) {
@@ -15519,6 +15563,193 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// Find GATED_DELTA_NET nodes whose recurrent state makes a round trip through a scratch copy:
+//   rows = GET_ROWS(states, ids) -> RESHAPE/VIEW ... -> GATED_DELTA_NET src[5]
+//   CPY(VIEW(gdn, state tail), cache view)
+// For one sequence and one state slot, the GDN kernel can read the state from the cache row and write the new
+// state straight into the cache view instead (each lane writes exactly the elements it read). The GET_ROWS and the
+// CPY are then skipped. Disable with GGML_VK_DISABLE_GDN_INPLACE.
+static void ggml_vk_find_gdn_inplace(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int last_node) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_GDN_INPLACE") != nullptr;
+    if (disabled || ctx->device->disable_fusion) {
+        ctx->gdn_inplace.clear();
+        ctx->skip_nodes.clear();
+        return;
+    }
+
+    // llama.cpp reuses the same graph for every decode step: skip the search when the graph is unchanged
+    uint64_t key = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+    mix(cgraph->n_nodes);
+    mix(last_node);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        mix((uintptr_t) n);
+        mix(n->op);
+        mix((uintptr_t) n->data);
+        mix(n->view_offs);
+        mix(n->ne[0] ^ (n->ne[1] << 20) ^ (n->ne[2] << 40) ^ (n->ne[3] << 52));
+        for (int j = 0; j < GGML_MAX_SRC && n->src[j]; j++) {
+            mix((uintptr_t) n->src[j]);
+            mix((uintptr_t) n->src[j]->data);
+        }
+    }
+    if (key == ctx->gdn_inplace_key) {
+        return;
+    }
+    ctx->gdn_inplace_key = key;
+    ctx->gdn_inplace.clear();
+    ctx->skip_nodes.clear();
+
+    struct candidate {
+        ggml_tensor * gdn;
+        int gdn_idx;
+        const ggml_tensor * rows;
+        int rows_idx;
+        const ggml_tensor * tail;  // view of the gdn output's state part
+        ggml_tensor * cpy;
+        int cpy_idx;
+        size_t s_off_bytes;
+        bool ok;
+    };
+    std::vector<candidate> cands;
+    // tensor -> (candidate, the only node allowed to read it): the gathered state and the views up to the gdn
+    std::unordered_map<const ggml_tensor *, std::pair<size_t, const ggml_tensor *>> expect;
+    std::unordered_map<const ggml_tensor *, size_t> gdn_of, tail_of, rows_of;
+    for (int i = 0; i <= last_node; i++) {
+        ggml_tensor * g = cgraph->nodes[i];
+        if (g->op != GGML_OP_GATED_DELTA_NET || g->type != GGML_TYPE_F32 || !g->buffer) {
+            continue;
+        }
+        const ggml_tensor * st = g->src[5];
+        // one state slot (K == 1) and one sequence
+        if (st->ne[1] != 1 || st->ne[2] != 1 || g->src[2]->ne[3] != 1) {
+            continue;
+        }
+        std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> chain; // (tensor, its only reader)
+        const ggml_tensor * reader = g;
+        const ggml_tensor * t = st;
+        while ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_offs == 0 && ggml_is_contiguous(t)) {
+            chain.push_back({ t, reader });
+            reader = t;
+            t = t->src[0];
+        }
+        if (t->op != GGML_OP_GET_ROWS || !ggml_is_contiguous(t) || !t->buffer) {
+            continue;
+        }
+        const ggml_tensor * states = t->src[0];
+        const ggml_tensor * ids    = t->src[1];
+        if (states->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 ||
+            !states->buffer || !ids->buffer || states->ne[0] != ggml_nelements(st) || states->nb[0] != sizeof(float) ||
+            states->ne[2] != 1 || states->ne[3] != 1) {
+            continue;
+        }
+        chain.push_back({ t, reader });
+        const size_t ci = cands.size();
+        cands.push_back({ g, i, t, -1, nullptr, nullptr, -1, ggml_nbytes(g) - ggml_nbytes(st), true });
+        for (auto & e : chain) {
+            expect[e.first] = { ci, e.second };
+        }
+        gdn_of[g] = ci;
+        rows_of[t] = ci;
+    }
+    if (cands.empty()) {
+        return;
+    }
+
+    // nodes that write or read memory in a cache buffer, for the hazard check below
+    std::set<const ggml_backend_buffer *> cache_bufs;
+    for (auto & c : cands) {
+        cache_bufs.insert(c.rows->src[0]->buffer);
+    }
+    std::vector<int> cache_nodes;
+
+    for (int i = 0; i <= last_node; i++) {
+        ggml_tensor * n = cgraph->nodes[i];
+        bool touches_cache = n->buffer && cache_bufs.count(n->buffer);
+        auto r = rows_of.find(n);
+        if (r != rows_of.end()) {
+            cands[r->second].rows_idx = i;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * s = n->src[j];
+            if (!s) {
+                continue;
+            }
+            touches_cache = touches_cache || (s->buffer && cache_bufs.count(s->buffer));
+            auto e = expect.find(s);
+            if (e != expect.end() && n != e->second.second) {
+                cands[e->second.first].ok = false;
+            }
+            auto g = gdn_of.find(s);
+            if (g != gdn_of.end()) {
+                candidate & c = cands[g->second];
+                // the state part of the gdn output may only be read through one view, by one CPY
+                if (n->op != GGML_OP_VIEW) {
+                    c.ok = false;
+                } else if (n->view_offs + ggml_nbytes(n) > c.s_off_bytes) {
+                    c.ok = c.ok && c.tail == nullptr && n->view_offs == c.s_off_bytes && ggml_is_contiguous(n) &&
+                           ggml_nbytes(n) == ggml_nbytes(c.gdn->src[5]);
+                    c.tail = n;
+                    tail_of[n] = g->second;
+                }
+            }
+            auto t = tail_of.find(s);
+            if (t != tail_of.end()) {
+                candidate & c = cands[t->second];
+                const ggml_tensor * d = n->src[1];
+                c.ok = c.ok && n->op == GGML_OP_CPY && j == 0 && c.cpy == nullptr && d && d->buffer &&
+                       d->type == GGML_TYPE_F32 && ggml_is_contiguous(d) && ggml_nbytes(d) == ggml_nbytes(c.tail) &&
+                       i > c.gdn_idx && i < last_node;
+                c.cpy = n;
+                c.cpy_idx = i;
+            }
+        }
+        if (touches_cache) {
+            cache_nodes.push_back(i);
+        }
+    }
+
+    for (auto & c : cands) {
+        if (!c.ok || !c.cpy || c.rows_idx < 0 || c.rows_idx >= c.gdn_idx) {
+            continue;
+        }
+        const ggml_tensor * states    = c.rows->src[0];
+        const ggml_tensor * state_dst = c.cpy->src[1];
+        if (!ggml_vk_tensors_overlap(state_dst, states, false)) {
+            continue;
+        }
+        // no other node may write the cache rows while the state is live (between the GET_ROWS and the CPY),
+        // or read them between the gdn and the CPY
+        for (int i : cache_nodes) {
+            if (i <= c.rows_idx || i >= c.cpy_idx || i == c.gdn_idx) {
+                continue;
+            }
+            const ggml_tensor * n = cgraph->nodes[i];
+            // (zero-size nodes, e.g. the copy of "extra" states when there are none, cannot conflict)
+            if (n->buffer && !ggml_op_is_empty(n->op) && ggml_nbytes(n) != 0 && ggml_vk_tensors_overlap(n, states, false)) {
+                c.ok = false;
+                break;
+            }
+            for (int j = 0; j < GGML_MAX_SRC && c.ok && i > c.gdn_idx && !ggml_op_is_empty(n->op); j++) {
+                if (n->src[j] && n->src[j]->buffer && n->src[j]->op != GGML_OP_NONE && ggml_nbytes(n->src[j]) != 0 &&
+                    ggml_vk_tensors_overlap(n->src[j], states, false)) {
+                    c.ok = false;
+                }
+            }
+            if (!c.ok) {
+                break;
+            }
+        }
+        if (!c.ok) {
+            continue;
+        }
+        ctx->gdn_inplace[c.gdn] = { states, c.rows->src[1], state_dst };
+        ctx->skip_nodes.insert(c.rows);
+        ctx->skip_nodes.insert(c.cpy);
+    }
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -15543,6 +15774,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     // Reserve tensor context space for all nodes
     ctx->tensor_ctxs.resize(cgraph->n_nodes);
+
+    ggml_vk_find_gdn_inplace(ctx, cgraph, last_node);
 
     bool first_node_in_batch = true; // true if next node will be first node in a batch
     int submit_node_idx = 0; // index to first node in a batch
