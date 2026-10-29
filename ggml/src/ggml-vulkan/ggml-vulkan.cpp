@@ -4556,6 +4556,26 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq_int = 2;
     }
     uint32_t rm_iq = 2 * rm_kq;
+    if (device->architecture == AMD_RDNA2) {
+        if (device->properties.deviceID == 0x1681) {
+            rm_iq = 8;
+            rm_kq = 4;
+        }
+        const char * iq_value = getenv("GGML_VK_RDNA2_IQ_ROWS");
+        const char * kq_value = getenv("GGML_VK_RDNA2_KQ_ROWS");
+        if (iq_value != nullptr) {
+            const int rows = std::atoi(iq_value);
+            if (rows == 1 || rows == 2 || rows == 4 || rows == 8) {
+                rm_iq = uint32_t(rows);
+            }
+        }
+        if (kq_value != nullptr) {
+            const int rows = std::atoi(kq_value);
+            if (rows == 1 || rows == 2 || rows == 4) {
+                rm_kq = uint32_t(rows);
+            }
+        }
+    }
 
     const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
     // Ensure a subgroup size >= 16 is available
@@ -7902,6 +7922,7 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
     const bool mm_l = is_q8_1 ? ctx->device->mul_mat_id_l_int[src0_type] : ctx->device->mul_mat_id_l[src0_type];
     const bool mm_m = is_q8_1 ? ctx->device->mul_mat_id_m_int[src0_type] : ctx->device->mul_mat_id_m[src0_type];
     const bool mm_s = is_q8_1 ? ctx->device->mul_mat_id_s_int[src0_type] : ctx->device->mul_mat_id_s[src0_type];
+
 
     if (ctx->device->coopmat2) {
         // Use large shader when the N dimension is greater than the medium shader's tile size
@@ -11559,8 +11580,30 @@ static void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subc
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_OPT_STEP_SGD, { (uint32_t)n, 0, 0.0f, 0.0f, 0.0f, 0.0f });
 }
 
+static void ggml_vk_cpy(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst);
+
 static void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     int * op_params = (int *)dst->op_params;
+
+    if (ctx->device->architecture == AMD_RDNA2 && ctx->device->properties.deviceID == 0x1681 &&
+        getenv("GGML_VK_RDNA2_NO_CONCAT_TRANSPOSE") == nullptr && op_params[0] == 0 &&
+        src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src0->ne[0] > 0 && src1->nb[1] == sizeof(float) && src1->ne[0] >= 32 && src1->ne[1] >= 32 && ggml_is_contiguous(dst)) {
+        ggml_tensor prefix = *dst;
+        prefix.ne[0] = src0->ne[0];
+        prefix.view_src = dst;
+        prefix.view_offs = 0;
+
+        ggml_tensor suffix = *dst;
+        suffix.ne[0] = src1->ne[0];
+        suffix.view_src = dst;
+        suffix.view_offs = src0->ne[0] * dst->nb[0];
+        suffix.data = dst->data != nullptr ? (char *) dst->data + suffix.view_offs : nullptr;
+
+        ggml_vk_cpy(ctx, subctx, src0, &prefix);
+        ggml_vk_cpy(ctx, subctx, src1, &suffix);
+        return;
+    }
 
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
