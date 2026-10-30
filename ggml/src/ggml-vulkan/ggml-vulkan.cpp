@@ -1566,6 +1566,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t state_mode;
     uint32_t state_row_stride;
     uint32_t state_out_off;
+    uint32_t pro_mode;
+    float l2_eps;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -1993,6 +1995,17 @@ struct ggml_backend_vk_context {
     };
     std::unordered_map<const ggml_tensor *, gdn_inplace_info> gdn_inplace;
     std::set<const ggml_tensor *> skip_nodes;
+    // GDN nodes that compute their input ops themselves (ggml_vk_find_gdn_prologue): the tensors to bind instead
+    struct gdn_prologue_info {
+        const ggml_tensor * q;     // L2_NORM inputs (mode bit 0)
+        const ggml_tensor * k;
+        float l2_eps;
+        const ggml_tensor * beta;  // SIGMOID input (bit 1)
+        const ggml_tensor * g;     // SOFTPLUS input (bit 2)
+        const ggml_tensor * ga;    // the MUL's per-head factor
+        uint32_t mode;
+    };
+    std::unordered_map<const ggml_tensor *, gdn_prologue_info> gdn_prologue;
     uint64_t gdn_inplace_key {};
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
@@ -5218,7 +5231,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
         }
@@ -11448,20 +11461,47 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         state_out_off    = (uint32_t)((out_buf.offset - states_buf.offset) / sizeof(float));
     }
 
+    // binding 8 is only read with pro_mode bit 2
+    vk_subbuffer ga_buf = src_buf[3];
+    uint32_t pro_mode = 0;
+    float l2_eps = 0.0f;
+    uint32_t sq[3] = { sq1, sq2, sq3 };
+    auto pro = ctx->gdn_prologue.find(dst);
+    if (pro != ctx->gdn_prologue.end()) {
+        const auto & pi = pro->second;
+        pro_mode = pi.mode;
+        if (pi.mode & 1) {
+            src_buf[0] = ggml_vk_tensor_subbuffer(ctx, pi.q);
+            src_buf[1] = ggml_vk_tensor_subbuffer(ctx, pi.k);
+            for (int i = 0; i < 3; i++) {
+                sq[i] = (uint32_t)(pi.q->nb[i + 1] / sizeof(float));
+            }
+            l2_eps = pi.l2_eps;
+        }
+        if (pi.mode & 2) {
+            src_buf[4] = ggml_vk_tensor_subbuffer(ctx, pi.beta);
+        }
+        if (pi.mode & 4) {
+            src_buf[3] = ggml_vk_tensor_subbuffer(ctx, pi.g);
+            ga_buf     = ggml_vk_tensor_subbuffer(ctx, pi.ga);
+        }
+    }
+
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
-        sq1, sq2, sq3,
+        sq[0], sq[1], sq[2],
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
         K,
-        state_mode, state_row_stride, state_out_off
+        state_mode, state_row_stride, state_out_off,
+        pro_mode, l2_eps
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, ids_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, ids_buf, ga_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -13928,6 +13968,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         if (gdn_inplace != ctx->gdn_inplace.end()) {
             need_sync = true;
         }
+        // A gdn with a folded prologue reads tensors that are not its srcs (the inputs of the skipped ops).
+        const auto gdn_prologue = node->op == GGML_OP_GATED_DELTA_NET ? ctx->gdn_prologue.find(node) : ctx->gdn_prologue.end();
+        if (gdn_prologue != ctx->gdn_prologue.end()) {
+            need_sync = true;
+        }
 
         if (need_sync) {
             if (vk_enable_sync_logger) {
@@ -13955,6 +14000,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     continue;
                 }
                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
+            }
+        }
+        if (gdn_prologue != ctx->gdn_prologue.end()) {
+            for (const ggml_tensor * t : { gdn_prologue->second.q, gdn_prologue->second.k, gdn_prologue->second.beta,
+                                           gdn_prologue->second.g, gdn_prologue->second.ga }) {
+                if (t) {
+                    ctx->unsynced_nodes_read.push_back(t);
+                }
             }
         }
         if (gdn_inplace != ctx->gdn_inplace.end()) {
@@ -15044,6 +15097,12 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
+    // a node folded into another op is not computed, so it cannot be part of a fusion either
+    for (size_t i = 0; i < ops.size(); i++) {
+        if (ctx->skip_nodes.count(cgraph->nodes[node_idx + i])) {
+            return false;
+        }
+    }
 
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         // additional constraints specific to this fusion
@@ -15569,10 +15628,152 @@ static int32_t find_first_set(uint32_t x) {
 // For one sequence and one state slot, the GDN kernel can read the state from the cache row and write the new
 // state straight into the cache view instead (each lane writes exactly the elements it read). The GET_ROWS and the
 // CPY are then skipped. Disable with GGML_VK_DISABLE_GDN_INPLACE.
+// Lets a GATED_DELTA_NET compute the small ops that feed it (the q/k L2 norms, the beta sigmoid and the gate's
+// softplus * a) instead of running them as separate nodes: on a decode step each of them is a ~3.5 us dispatch.
+// An op is folded only when its output reaches nothing but the gdn (through reshapes/views).
+static void ggml_vk_find_gdn_prologue(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int last_node) {
+    static const bool disabled = getenv("GGML_VK_DISABLE_GDN_PROLOGUE") != nullptr;
+    if (disabled) {
+        return;
+    }
+    static const uint32_t mask = getenv("GGML_VK_GDN_PROLOGUE_MASK") ? (uint32_t)atoi(getenv("GGML_VK_GDN_PROLOGUE_MASK")) : 7u;
+    auto unary_is = [](const ggml_tensor * t, ggml_unary_op op) {
+        return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op;
+    };
+    auto aligned = [&](const ggml_tensor * t) {
+        return t->buffer && get_misalign_bytes(ctx, t) == 0;
+    };
+    struct candidate {
+        ggml_tensor * gdn;
+        ggml_backend_vk_context::gdn_prologue_info info;
+        std::vector<const ggml_tensor *> folded;  // skipped when the candidate is accepted
+        bool ok;
+    };
+    std::vector<candidate> cands;
+    // tensor -> (candidate, the only node allowed to read it)
+    std::unordered_map<const ggml_tensor *, std::pair<size_t, const ggml_tensor *>> expect;
+
+    for (int i = 0; i <= last_node; i++) {
+        ggml_tensor * g = cgraph->nodes[i];
+        if (g->op != GGML_OP_GATED_DELTA_NET || g->type != GGML_TYPE_F32 || !g->buffer) {
+            continue;
+        }
+        const ggml_tensor * src_g = g->src[3];
+        const ggml_tensor * src_beta = g->src[4];
+        const uint32_t H = (uint32_t)g->src[2]->ne[1];
+        if (src_g->ne[0] != 1 || !ggml_is_contiguous(src_g) || !ggml_is_contiguous(src_beta) ||
+            !ggml_are_same_shape(src_g, src_beta)) {
+            continue;  // KDA (per-element gate) or unusual layouts
+        }
+        candidate c = { g, {}, {}, true };
+        std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> chain;
+        // follow reshapes/views of a whole tensor back from a gdn input, recording (tensor, its only reader)
+        auto unwrap = [&](const ggml_tensor * t, std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> & ch) {
+            const ggml_tensor * reader = g;
+            while ((t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_offs == 0 && ggml_is_contiguous(t) &&
+                   ggml_nelements(t) == ggml_nelements(t->src[0])) {
+                ch.push_back({ t, reader });
+                reader = t;
+                t = t->src[0];
+            }
+            ch.push_back({ t, reader });
+            return t;
+        };
+
+        std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> cq, ck;
+        const ggml_tensor * nq = unwrap(g->src[0], cq);
+        const ggml_tensor * nk = unwrap(g->src[1], ck);
+        if ((mask & 1) && nq->op == GGML_OP_L2_NORM && nk->op == GGML_OP_L2_NORM && nq->type == GGML_TYPE_F32 && nk->type == GGML_TYPE_F32 &&
+            ggml_get_op_params_f32(nq, 0) == ggml_get_op_params_f32(nk, 0)) {
+            const ggml_tensor * q = nq->src[0];
+            const ggml_tensor * k = nk->src[0];
+            bool ok = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) &&
+                      ggml_are_same_shape(q, g->src[0]) && ggml_are_same_shape(k, g->src[1]) && aligned(q) && aligned(k);
+            for (int d = 1; d < 4 && ok; d++) {
+                ok = q->nb[d] == k->nb[d] && q->nb[d] % sizeof(float) == 0;
+            }
+            if (ok) {
+                c.info.mode |= 1;
+                c.info.q = q;
+                c.info.k = k;
+                c.info.l2_eps = ggml_get_op_params_f32(nq, 0);
+                c.folded.push_back(nq);
+                c.folded.push_back(nk);
+                chain.insert(chain.end(), cq.begin(), cq.end());
+                chain.insert(chain.end(), ck.begin(), ck.end());
+            }
+        }
+
+        std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> cb_;
+        const ggml_tensor * nb = unwrap(src_beta, cb_);
+        if ((mask & 2) && unary_is(nb, GGML_UNARY_OP_SIGMOID) && nb->type == GGML_TYPE_F32 && nb->src[0]->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(nb) && ggml_is_contiguous(nb->src[0]) && ggml_nelements(nb->src[0]) == ggml_nelements(src_beta) &&
+            aligned(nb->src[0])) {
+            c.info.mode |= 2;
+            c.info.beta = nb->src[0];
+            c.folded.push_back(nb);
+            chain.insert(chain.end(), cb_.begin(), cb_.end());
+        }
+
+        std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> cg;
+        const ggml_tensor * nm = unwrap(src_g, cg);
+        if ((mask & 4) && nm->op == GGML_OP_MUL && nm->type == GGML_TYPE_F32 && ggml_is_contiguous(nm)) {
+            const ggml_tensor * sp = nm->src[0];
+            const ggml_tensor * a  = nm->src[1];
+            if (unary_is(sp, GGML_UNARY_OP_SOFTPLUS) && sp->type == GGML_TYPE_F32 && ggml_is_contiguous(sp) &&
+                ggml_are_same_shape(sp, nm) && sp->ne[0] == H && ggml_nelements(sp) == ggml_nelements(src_g) &&
+                sp->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(sp->src[0]) &&
+                ggml_nelements(sp->src[0]) == ggml_nelements(sp) && aligned(sp->src[0]) &&
+                a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && a->ne[0] == H && ggml_nelements(a) == H && aligned(a)) {
+                c.info.mode |= 4;
+                c.info.g  = sp->src[0];
+                c.info.ga = a;
+                c.folded.push_back(nm);
+                c.folded.push_back(sp);
+                chain.insert(chain.end(), cg.begin(), cg.end());
+                chain.push_back({ sp, nm });
+            }
+        }
+        if (c.info.mode == 0) {
+            continue;
+        }
+        const size_t ci = cands.size();
+        for (auto & e : chain) {
+            if (e.first->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                c.ok = false;
+            }
+            expect[e.first] = { ci, e.second };
+        }
+        cands.push_back(std::move(c));
+    }
+    if (cands.empty()) {
+        return;
+    }
+    for (int i = 0; i <= last_node; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            auto e = n->src[j] ? expect.find(n->src[j]) : expect.end();
+            if (e != expect.end() && n != e->second.second) {
+                cands[e->second.first].ok = false;
+            }
+        }
+    }
+    for (auto & c : cands) {
+        if (!c.ok) {
+            continue;
+        }
+        ctx->gdn_prologue[c.gdn] = c.info;
+        for (const ggml_tensor * t : c.folded) {
+            ctx->skip_nodes.insert(t);
+        }
+    }
+}
+
 static void ggml_vk_find_gdn_inplace(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int last_node) {
     static const bool disabled = getenv("GGML_VK_DISABLE_GDN_INPLACE") != nullptr;
     if (disabled || ctx->device->disable_fusion) {
         ctx->gdn_inplace.clear();
+        ctx->gdn_prologue.clear();
         ctx->skip_nodes.clear();
         return;
     }
@@ -15599,7 +15800,10 @@ static void ggml_vk_find_gdn_inplace(ggml_backend_vk_context * ctx, const ggml_c
     }
     ctx->gdn_inplace_key = key;
     ctx->gdn_inplace.clear();
+    ctx->gdn_prologue.clear();
     ctx->skip_nodes.clear();
+
+    ggml_vk_find_gdn_prologue(ctx, cgraph, last_node);
 
     struct candidate {
         ggml_tensor * gdn;

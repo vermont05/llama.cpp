@@ -37,6 +37,12 @@ layout(push_constant) uniform Parameters {
     uint state_mode;
     uint state_row_stride;
     uint state_out_off;
+    // pro_mode: the gdn computes ops that would otherwise run as separate nodes before it.
+    //   bit 0: q and k (bindings 0, 1) are not yet L2-normalized (eps = l2_eps)
+    //   bit 1: beta (binding 4) is the input of the sigmoid
+    //   bit 2: g (binding 3) is the input of softplus, then multiplied by data_ga[head]
+    uint pro_mode;
+    float l2_eps;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -47,6 +53,7 @@ layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5)           buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 layout(binding = 7) readonly  buffer IdsBuf   { int data_ids[];          };
+layout(binding = 8) readonly  buffer GABuf    { FLOAT_TYPE data_ga[];    };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -131,7 +138,10 @@ void main() {
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        if ((pro_mode & 2u) != 0u) {
+            beta_val = FLOAT_TYPE(1. / (1 + exp(-1. * float(beta_val))));
+        }
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];
@@ -140,10 +150,28 @@ void main() {
             k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
             q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
         }
+        if ((pro_mode & 1u) != 0u) {
+            FLOAT_TYPE kk = 0.0, qq = 0.0;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                kk += k_reg[r] * k_reg[r];
+                qq += q_reg[r] * q_reg[r];
+            }
+            const FLOAT_TYPE k_scale = FLOAT_TYPE(1.0f) / max(sqrt(reduce_partial(kk)), FLOAT_TYPE(l2_eps));
+            const FLOAT_TYPE q_scale = FLOAT_TYPE(1.0f) / max(sqrt(reduce_partial(qq)), FLOAT_TYPE(l2_eps));
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                k_reg[r] = k_scale * k_reg[r];
+                q_reg[r] = q_scale * q_reg[r];
+            }
+        }
 
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0) {
-            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
+            FLOAT_TYPE g_in = FLOAT_TYPE(data_g[gb_off]);
+            if ((pro_mode & 4u) != 0u) {
+                const float x = float(g_in);
+                g_in = FLOAT_TYPE((x > 20.0f) ? x : log(1.0f + exp(x))) * FLOAT_TYPE(data_ga[head_id]);
+            }
+            const FLOAT_TYPE g_val = exp(g_in);
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 g_exp[r] = g_val;
             }
