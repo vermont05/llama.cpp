@@ -623,6 +623,14 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // the memory rolls back only to a context checkpoint (recurrent state): a cached prompt restores up to its newest
+    // checkpoint within the common prefix, see n_usable()
+    bool rolls_back_to_checkpoints = false;
+
+    // the prefix of a new prompt that a state restores, given their common prefix lcp: all of it, or, for a memory that
+    // rolls back only to checkpoints, the newest checkpoint within it (all of it if the state is a prefix of the new one)
+    size_t n_usable(const server_prompt & prompt, size_t lcp) const;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -630,6 +638,9 @@ struct server_prompt_cache {
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // load() for rolls_back_to_checkpoints
+    bool load_checkpointed(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
 };

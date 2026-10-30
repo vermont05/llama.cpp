@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -1277,6 +1278,9 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->rolls_back_to_checkpoints =
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1285,6 +1289,8 @@ private:
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            SRV_INF("checkpoint root = %d, spread = %s, cache save min = %d\n",
+                    params_base.checkpoint_root, params_base.checkpoint_spread ? "on" : "off", params_base.cache_save_min);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -1514,6 +1520,23 @@ private:
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
+                }
+
+                if (prompt_cache && prompt_cache->rolls_back_to_checkpoints) {
+                    // the slot keeps only what it rolls back to (a checkpoint): it may lose more than f_keep says
+                    const size_t lcp    = ret->prompt.tokens.get_common_prefix(task.tokens);
+                    const size_t usable = prompt_cache->n_usable(ret->prompt, lcp);
+                    if (usable < 0.5f*ret->prompt.tokens.size()) {
+                        update_cache = true;
+                    }
+                    // --cache-save-min: also a smaller part of a long prompt, e.g. the tail of another conversation
+                    if (params_base.cache_save_min > 0 && ret->prompt.tokens.size() - usable >= (size_t) params_base.cache_save_min) {
+                        update_cache = true;
+                    }
+                    if (update_cache) {
+                        SLT_INF(*ret, "the slot rolls back to %zu of its %zu tokens (common prefix %zu): saving it to the prompt cache\n",
+                                usable, (size_t) ret->prompt.tokens.size(), lcp);
+                    }
                 }
             }
         }
@@ -2207,15 +2230,76 @@ private:
         return true;
     }
 
+    // --checkpoint-root: the end of the system prompt (the start of the first user message) if it has at least
+    // checkpoint_root tokens, else -1
+    int32_t checkpoint_root_pos(const common_chat_msg_spans & spans) const {
+        if (params_base.checkpoint_root <= 0) {
+            return -1;
+        }
+        for (const auto & span : spans.spans) {
+            if (span.role == COMMON_CHAT_ROLE_USER) {
+                return (int32_t) span.pos >= params_base.checkpoint_root ? (int32_t) span.pos : -1;
+            }
+        }
+        return -1;
+    }
+
+    // the checkpoint that --checkpoint-spread evicts to make room for one at n_new: not the root and not the newest,
+    // the one whose removal leaves the smallest gap for its distance from n_new. end() if there is none
+    static std::list<common_prompt_checkpoint>::iterator checkpoint_spread_victim(std::list<common_prompt_checkpoint> & checkpoints, int64_t n_new) {
+        auto    best       = checkpoints.end();
+        double  best_score = std::numeric_limits<double>::infinity();
+        int64_t prev       = 0;
+        for (auto it = checkpoints.begin(); it != checkpoints.end(); ++it) {
+            const auto next = std::next(it);
+            if (!it->root && next != checkpoints.end()) {
+                const double gap   = double(next->n_tokens - prev);
+                const double dist  = double(std::max<int64_t>(1, n_new - it->n_tokens));
+                const double score = gap/dist;
+                if (score < best_score) {
+                    best_score = score;
+                    best       = it;
+                }
+            }
+            prev = it->n_tokens;
+        }
+        return best;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // root: the checkpoint is at the end of the system prompt and is kept for good (--checkpoint-root)
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool root = false) {
         const int id_task = slot.task->id;
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        int64_t last = -1;
+        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+
+        // replace a checkpoint at the same position (e.g. the one the slot was just restored from)
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->n_tokens == n_tokens_new) {
+                root |= it->root;
+                it = slot.prompt.checkpoints.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (params_base.checkpoint_spread) {
+            while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+                auto it = checkpoint_spread_victim(slot.prompt.checkpoints, n_tokens_new);
+                if (it == slot.prompt.checkpoints.end()) {
+                    break;
+                }
+                SLT_TRC(slot, "erasing context checkpoint that leaves the smallest gap (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        it->n_tokens, (float) it->size() / 1024 / 1024);
+                slot.prompt.checkpoints.erase(it);
+            }
+        }
+
+        // evict checkpoints within min-step of a previous checkpoint, unless they were
+        // created by the current task or are the root
+        int64_t last = -1;
+        for (auto it = slot.prompt.checkpoints.begin(); !params_base.checkpoint_spread && it != slot.prompt.checkpoints.end(); ) {
+            if (it->id_task != id_task && !it->root && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2228,18 +2312,37 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // make room for the new checkpoint, if needed: the oldest one that is not the root
+            auto it = slot.prompt.checkpoints.begin();
+            while (it != slot.prompt.checkpoints.end() && it->root) {
+                ++it;
+            }
+            if (it == slot.prompt.checkpoints.end()) {
+                it = slot.prompt.checkpoints.begin();
+            }
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it);
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        if (root) {
+            // one root per slot: an earlier one (of another system prompt) rotates like the others from now on
+            for (auto & ckpt : slot.prompt.checkpoints) {
+                ckpt.root = false;
+            }
+        }
+
+        // keep the list in position order (a checkpoint may land before later ones after a restore)
+        auto pos_it = slot.prompt.checkpoints.begin();
+        while (pos_it != slot.prompt.checkpoints.end() && pos_it->n_tokens < n_tokens_new) {
+            ++pos_it;
+        }
+        auto & cur = *slot.prompt.checkpoints.emplace(pos_it);
 
         cur.id_task = id_task;
+        cur.root    = root;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -2255,6 +2358,10 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+        if (root) {
+            SLT_INF(slot, "created the root checkpoint at the end of the system prompt (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    cur.n_tokens, (float) cur.size() / 1024 / 1024);
+        }
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3406,6 +3513,9 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // --checkpoint-root: the end of the system prompt
+                    const int32_t root_pos = checkpoint_root_pos(spans);
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -3437,7 +3547,8 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || pos == root_pos || checkpoints.empty() ||
+                                    pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -3473,6 +3584,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_root = root_pos >= 0 && n_tokens_start == root_pos;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -3510,14 +3622,14 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_root ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_root);
                     }
                 }
 
