@@ -65,6 +65,9 @@ struct task_params {
     // number of prompt tokens before the latest user message
     int32_t n_before_user = -1;
 
+    // the number of tokens before the first user message (the system prompt), -1 if unknown (--checkpoint-root)
+    int32_t n_before_first_user = -1;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
@@ -639,6 +642,14 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // the memory rolls back only to a context checkpoint (recurrent state): a cached prompt restores up to its newest
+    // checkpoint within the common prefix, see n_usable()
+    bool rolls_back_to_checkpoints = false;
+
+    // the prefix of a new prompt that a state restores, given their common prefix lcp: all of it, or, for a memory that
+    // rolls back only to checkpoints, the newest checkpoint within it (all of it if the state is a prefix of the new one)
+    size_t n_usable(const server_prompt & prompt, size_t lcp) const;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -646,6 +657,9 @@ struct server_prompt_cache {
     server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
+
+    // load() for rolls_back_to_checkpoints
+    bool load_checkpointed(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     void update();
 };

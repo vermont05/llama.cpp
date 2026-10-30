@@ -599,6 +599,9 @@ struct common_params {
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints
+    int32_t checkpoint_root     = 0;     // keep a checkpoint at the end of a system prompt of at least this many tokens (0 = off)
+    bool    checkpoint_spread   = false; // evict the checkpoint that leaves the smallest gap for its distance from the end
+    int32_t cache_save_min      = 0;     // save a slot's prompt before another one takes the slot if it loses this many tokens (0 = only more than half)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
@@ -1055,6 +1058,9 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;
+
+    // at the end of the system prompt, kept for good (--checkpoint-root)
+    bool root = false;
 
     llama_pos pos_min;
     llama_pos pos_max;
