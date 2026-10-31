@@ -124,7 +124,11 @@ struct server_slot {
 
     server_prompt prompt;
 
-    void prompt_save(server_prompt_cache & prompt_cache) const {
+    // the end of the prefix the current task shares with an earlier prompt, for a checkpoint there (-1 = none), see
+    // get_available_slot()
+    int32_t n_shared = -1;
+
+    bool prompt_save(server_prompt_cache & prompt_cache, bool root = false) const {
         GGML_ASSERT(prompt.data.size() == 0);
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -135,15 +139,63 @@ struct server_slot {
         SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, root);
         if (cur == nullptr) {
-            return;
+            return false;
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+
+        return true;
+    }
+
+    // --checkpoint-root: cut the slot back to its newest kept checkpoint (the end of the system prompt or of the prefix
+    // shared with an earlier prompt) and save that as a root entry with the kept checkpoints: small and evicted last, a
+    // new conversation on the same prefix resumes from it after the slot's own entry is gone. The slot loses the rest,
+    // so only for a slot that is about to take a prompt that resumes from it at most n_usable tokens
+    bool prompt_save_root(server_prompt_cache & prompt_cache, size_t n_usable) {
+        auto cut = prompt.checkpoints.end();
+        for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end(); ++it) {
+            if (it->kept() && (size_t) it->n_tokens <= prompt.tokens.size()) {
+                cut = it;
+            }
+        }
+        if (cut == prompt.checkpoints.end() || (size_t) cut->n_tokens < n_usable) {
+            return false;
+        }
+
+        const int64_t n_cut = cut->n_tokens;
+
+        if ((size_t) n_cut < prompt.tokens.size()) {
+            cut->load_tgt(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            common_context_seq_rm(ctx_tgt, id, cut->pos_max + 1, -1);
+            if (ctx_dft) {
+                cut->load_dft(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                common_context_seq_rm(ctx_dft, id, cut->pos_max + 1, -1);
+            }
+            prompt.tokens.keep_first(n_cut);
+        }
+
+        for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end(); ) {
+            if (!it->kept() || it->n_tokens > n_cut) {
+                it = prompt.checkpoints.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        const bool res = prompt_save(prompt_cache, true);
+        if (res) {
+            std::string at;
+            for (const auto & c : prompt.checkpoints) {
+                at += " " + std::to_string(c.n_tokens) + (c.shared ? " (shared)" : "") + (c.root ? " (root)" : "");
+            }
+            SLT_INF(*this, "saved a root entry of %" PRId64 " tokens, kept checkpoints at:%s\n", n_cut, at.c_str());
+        }
+        return res;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -1373,6 +1425,8 @@ private:
         if (ret) {
             const auto & tokens = ret->prompt.tokens;
 
+            ret->n_shared = -1;
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -1383,9 +1437,23 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                const bool use_root = prompt_cache->rolls_back_to_checkpoints && params_base.checkpoint_root > 0;
+
+                // the prefix the task shares with an earlier prompt, restorable or not: if it cannot resume there, it
+                // gets a checkpoint there (n_shared), so that the next one that shares it can
+                const size_t n_shared = use_root ?
+                    std::max(tokens.get_common_prefix(task.tokens), prompt_cache->n_common_prefix(task.tokens)) : 0;
+
+                // saving the slot must not evict the entry the task resumes from
+                prompt_cache->protect(task.tokens);
+
                 // don't save the slot's state if its context is empty
                 if (tokens.size() > 0) {
                     ret->prompt_save(*prompt_cache);
+
+                    if (use_root) {
+                        ret->prompt_save_root(*prompt_cache, prompt_cache->n_usable(ret->prompt, tokens.get_common_prefix(task.tokens)));
+                    }
                 }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
@@ -1393,6 +1461,17 @@ private:
                 }
 
                 prompt_cache->update();
+
+                // only for another conversation: one that shares at most the system prompt and part of the first user
+                // message (a conversation that comes back edited resumes from its own checkpoints)
+                const size_t n_first_turn = task.params.n_first_turn > 0 ? (size_t) task.params.n_first_turn : task.tokens.size();
+
+                if (use_root && n_shared >= (size_t) params_base.checkpoint_root && n_shared < n_first_turn &&
+                        n_shared < (size_t) task.n_tokens() &&
+                        n_shared > prompt_cache->n_usable(ret->prompt, tokens.get_common_prefix(task.tokens))) {
+                    ret->n_shared = (int32_t) n_shared;
+                    SLT_INF(*ret, "the prompt shares %zu tokens with an earlier one: a checkpoint there\n", n_shared);
+                }
 
                 SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2071,7 +2150,7 @@ private:
         int64_t prev       = 0;
         for (auto it = checkpoints.begin(); it != checkpoints.end(); ++it) {
             const auto next = std::next(it);
-            if (!it->root && next != checkpoints.end()) {
+            if (!it->kept() && next != checkpoints.end()) {
                 const double gap   = double(next->n_tokens - prev);
                 const double dist  = double(std::max<int64_t>(1, n_new - it->n_tokens));
                 const double score = gap/dist;
@@ -2087,13 +2166,15 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     // root: the checkpoint is at the end of the system prompt and is kept for good (--checkpoint-root)
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool root = false) {
+    // shared: the checkpoint is at the end of the prefix shared with an earlier prompt and is kept likewise
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool root = false, bool shared = false) {
         const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
 
         // replace a checkpoint at the same position (e.g. the one the slot was just restored from)
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
             if (it->n_tokens == n_tokens_new) {
-                root |= it->root;
+                root   |= it->root;
+                shared |= it->shared;
                 it = slot.prompt.checkpoints.erase(it);
             } else {
                 ++it;
@@ -2113,9 +2194,9 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed: the oldest one that is not the root
+            // make room for the new checkpoint, if needed: the oldest one that is not kept
             auto it = slot.prompt.checkpoints.begin();
-            while (it != slot.prompt.checkpoints.end() && it->root) {
+            while (it != slot.prompt.checkpoints.end() && it->kept()) {
                 ++it;
             }
             if (it == slot.prompt.checkpoints.end()) {
@@ -2134,6 +2215,12 @@ private:
                 ckpt.root = false;
             }
         }
+        if (shared) {
+            // likewise one shared prefix
+            for (auto & ckpt : slot.prompt.checkpoints) {
+                ckpt.shared = false;
+            }
+        }
 
         // keep the list in position order (a checkpoint may land before later ones after a restore)
         auto pos_it = slot.prompt.checkpoints.begin();
@@ -2142,7 +2229,8 @@ private:
         }
         auto & cur = *slot.prompt.checkpoints.emplace(pos_it);
 
-        cur.root = root;
+        cur.root   = root;
+        cur.shared = shared;
 
         cur.update_pos(n_tokens_new, pos_min, pos_max);
 
@@ -2155,6 +2243,10 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
         if (root) {
             SLT_INF(slot, "created the root checkpoint at the end of the system prompt (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    cur.n_tokens, (float) cur.size() / 1024 / 1024);
+        }
+        if (shared) {
+            SLT_INF(slot, "created the shared-prefix checkpoint (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.n_tokens, (float) cur.size() / 1024 / 1024);
         }
     }
@@ -3146,6 +3238,11 @@ private:
                             break;
                         }
 
+                        // break at the end of the prefix shared with an earlier prompt, for a checkpoint there
+                        if (do_checkpoint && slot.n_shared > 0 && slot.prompt.n_tokens() == slot.n_shared) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -3173,6 +3270,13 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
+                    // checkpoints are created before the current batch is decoded, so
+                    // their token position is the batch start rather than the prompt end
+                    const int32_t n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
+
+                    const bool is_root   = root_pos > 0 && n_tokens_start == root_pos;
+                    const bool is_shared = slot.n_shared > 0 && n_tokens_start == slot.n_shared;
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -3188,19 +3292,13 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints
-                        if (!n_before_user_known && !near_prompt_end) {
+                        if (!n_before_user_known && !near_prompt_end && !is_shared) {
                             do_checkpoint = false;
                         }
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-
-                    // checkpoints are created before the current batch is decoded, so
-                    // their token position is the batch start rather than the prompt end
-                    const int32_t n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
-
-                    const bool is_root = root_pos > 0 && n_tokens_start == root_pos;
 
                     {
                         const bool is_on_user =
@@ -3213,7 +3311,7 @@ private:
 
                         const bool is_allowed =
                             !n_before_user_known ||
-                            is_on_user || is_root ||
+                            is_on_user || is_root || is_shared ||
                             (is_after_user && near_prompt_end);
 
                         if (do_checkpoint && !is_allowed) {
@@ -3231,13 +3329,13 @@ private:
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
                     // no need to create checkpoints that are too close together
-                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || is_root || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || is_root || is_shared || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_root);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_root, is_shared);
                     }
                 }
 
@@ -3748,25 +3846,38 @@ void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
     impl->queue_tasks.on_sleeping_state(std::move(callback));
 }
 
-// compute the number of tokens before the last (or, with first, the first) user message in the prompt
+enum prompt_span_select {
+    PROMPT_SPAN_LAST_USER,   // the last user message
+    PROMPT_SPAN_FIRST_USER,  // the first user message (the end of the system prompt)
+    PROMPT_SPAN_FIRST_REPLY, // the first message after the first user message that is not a user or system one
+};
+
+// compute the number of tokens before the selected message in the prompt
 static int32_t prompt_get_n_before_user(
         const json & message_spans,
         const std::string & prompt,
         const std::vector<raw_buffer> & files,
         const llama_vocab * vocab,
         mtmd_context * mctx,
-        bool first = false) {
+        prompt_span_select select = PROMPT_SPAN_LAST_USER) {
     int32_t result = -1;
     int32_t byte_pos = -1;
 
+    bool seen_user = false;
     for (const auto & span : message_spans) {
         const std::string role = json_value(span, "role", std::string());
 
         if (role == "user") {
-            byte_pos = json_value(span, "pos", -1);
-            if (first) {
+            seen_user = true;
+            if (select == PROMPT_SPAN_LAST_USER) {
+                byte_pos = json_value(span, "pos", -1);
+            } else if (select == PROMPT_SPAN_FIRST_USER) {
+                byte_pos = json_value(span, "pos", -1);
                 break;
             }
+        } else if (select == PROMPT_SPAN_FIRST_REPLY && seen_user && role != "system") {
+            byte_pos = json_value(span, "pos", -1);
+            break;
         }
     }
 
@@ -3792,8 +3903,8 @@ static int32_t prompt_get_n_before_user(
             result = (int32_t) tokenize_input_prompts(vocab, nullptr, prefix, true, true)[0].size();
         }
 
-        SRV_TRC("message_spans: %s user message: byte_pos=%d, media=%zu, n_before_user=%d\n",
-                first ? "first" : "last", byte_pos, n_prefix_media, result);
+        SRV_TRC("message_spans: select=%d: byte_pos=%d, media=%zu, n_before=%d\n",
+                (int) select, byte_pos, n_prefix_media, result);
     }
 
     return result;
@@ -3868,7 +3979,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             files,
                             ctx_server.vocab,
                             ctx_server.mctx,
-                            true);
+                            PROMPT_SPAN_FIRST_USER);
+                    task.params.n_first_turn =
+                        prompt_get_n_before_user(
+                            message_spans,
+                            prompt.get<std::string>(),
+                            files,
+                            ctx_server.vocab,
+                            ctx_server.mctx,
+                            PROMPT_SPAN_FIRST_REPLY);
                 }
             }
 
