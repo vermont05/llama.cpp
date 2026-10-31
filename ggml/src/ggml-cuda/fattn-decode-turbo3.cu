@@ -10,8 +10,10 @@
 // by flash_attn_combine_results, which is linear, so it can stay in the original domain.
 //   - each warp stages its own 8-row K and V tiles (100 bytes per row, 4-byte loads) into shared memory,
 //   - QK: 16 lanes per K row, 16 values per lane; pairs of values are decoded through a 64-entry half2 table and
-//     multiplied with v_dot2_f32_f16 against a f16 copy of the rotated Q of all G heads in shared memory,
-//   - PV: 32 lanes per V row, 8 dims per lane, decoded through a 64-entry float2 table, f32 accumulators,
+//     multiplied with v_dot2_f32_f16 against a f16 copy of the rotated Q of all G heads (in registers for one token,
+//     in shared memory for two),
+//   - PV: 32 lanes per V row, 8 dims per lane, 2 rows at a time: the same table decodes both rows, v_perm pairs up
+//     their values per dim, and v_dot2_f32_f16 against (P nV) of the two rows accumulates in f32,
 //   - online softmax per warp, warps merged at the end as in the q4_0 kernel.
 // GGML_CUDA_NO_FA_DECODE_TURBO3=1 disables it (attention then goes through the f16 copy and the tile kernel).
 
@@ -144,11 +146,10 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
     // after the main loop the merged output reuse the same memory.
     constexpr int ne_stage = nwarps*2*(fattn_dt3_tile_w + 1) > GV*D ? nwarps*2*(fattn_dt3_tile_w + 1) : GV*D;
     __shared__ uint32_t KV_s_raw[ne_stage];
-    __shared__ float    P_s[nwarps][R][GV];
+    __shared__ fattn_dt3_h2 P_h[nwarps][R/2][GV];
     __shared__ float2   ml_s[nwarps][GV];
     __shared__ fattn_dt3_h2 lutK[64];
     __shared__ __align__(16) fattn_dt3_h2 Q_s[GV][D/2]; // rotated Q in f16 pairs
-    __shared__ float2       lutV[64];
     float (*X_s)[D] = (float (*)[D]) KV_s_raw;
 
     // pair tables: index = lo2(a) | lo2(b) << 2 | hi(a) << 4 | hi(b) << 5
@@ -156,7 +157,6 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
         const int ia = (tid & 3)        | ((tid >> 4) & 1) << 2;
         const int ib = ((tid >> 2) & 3) | ((tid >> 5) & 1) << 2;
         lutK[tid] = fattn_dt3_h2{(_Float16) turbo3_centroids[ia], (_Float16) turbo3_centroids[ib]};
-        lutV[tid] = make_float2(turbo3_centroids[ia], turbo3_centroids[ib]);
     }
 
     // Q * scale * log2(e), rotated per 128-value group. The softmax below works in base 2.
@@ -205,6 +205,21 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
     float KQ_max = -FLT_MAX/2.0f;
     float KQ_sum = 0.0f;
 
+    // With one token the lane's slice of Q (16 values x G heads) stays in registers, which saves the LDS bandwidth of
+    // re-reading it for every row pair; with two tokens it would not fit next to the accumulators.
+    constexpr bool Q_reg = GV <= 8;
+    uint32_t Q_r[Q_reg ? GV : 1][8];
+    __syncthreads();
+    if constexpr (Q_reg) {
+#pragma unroll
+        for (int h = 0; h < GV; ++h) {
+            const uint4 qa = ((const uint4 *) &Q_s[h][8*l16])[0];
+            const uint4 qb = ((const uint4 *) &Q_s[h][8*l16])[1];
+            Q_r[h][0] = qa.x; Q_r[h][1] = qa.y; Q_r[h][2] = qa.z; Q_r[h][3] = qa.w;
+            Q_r[h][4] = qb.x; Q_r[h][5] = qb.y; Q_r[h][6] = qb.z; Q_r[h][7] = qb.w;
+        }
+    }
+
     __syncthreads(); // X_s (the rotated Q) is no longer needed, the staging buffers take its place
 
     uint32_t * K_s = KV_s_raw + (2*warp + 0)*(fattn_dt3_tile_w + 1);
@@ -212,17 +227,27 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
 
+    // Next tile, prefetched into registers while the current one is processed. The mask goes first: the softmax waits
+    // for it, and the loads complete in order, so behind the K/V loads it would expose their latency. It is loaded as
+    // u16 into 32-bit registers: as half (d16 loads into register halves) the G = 6, NQ = 2 kernel gave wrong results.
     uint32_t pk[fattn_dt3_nld];
     uint32_t pv[fattn_dt3_nld];
+    uint32_t pm[R/2];
     auto load_tile = [&](const int row0_load) {
+#pragma unroll
+        for (int p = 0; p < R/2; ++p) {
+            pm[p] = ((const uint16_t *) maskh)[row0_load + 2*p + kr];
+        }
+        const char * K_t = K + int64_t(row0_load)*nb11;
+        const char * V_t = V + int64_t(row0_load)*nb21;
 #pragma unroll
         for (int j = 0; j < fattn_dt3_nld; ++j) {
             const int i = j*WARP_SIZE + lane;
-            if (i < fattn_dt3_tile_w) {
+            if (j < fattn_dt3_nld - 1 || i < fattn_dt3_tile_w) { // only the last load is partial
                 const int r = i / RW;
                 const int c = i - r*RW;
-                pk[j] = ((const uint32_t *) (K + int64_t(row0_load + r)*nb11))[c];
-                pv[j] = ((const uint32_t *) (V + int64_t(row0_load + r)*nb21))[c];
+                pk[j] = ((const uint32_t *) (K_t + r*nb11))[c];
+                pv[j] = ((const uint32_t *) (V_t + r*nb21))[c];
             }
         }
     };
@@ -238,10 +263,15 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
 #pragma unroll
         for (int j = 0; j < fattn_dt3_nld; ++j) {
             const int i = j*WARP_SIZE + lane;
-            if (i < fattn_dt3_tile_w) {
+            if (j < fattn_dt3_nld - 1 || i < fattn_dt3_tile_w) {
                 K_s[i] = pk[j];
                 V_s[i] = pv[j];
             }
+        }
+        float mk[R/2];
+#pragma unroll
+        for (int p = 0; p < R/2; ++p) {
+            mk[p] = float(__builtin_bit_cast(_Float16, (uint16_t) pm[p]))*1.4426950408889634f;
         }
         fattn_dt3_wave_sync();
         if (t0 + gridDim.y*fattn_dt3_tile < k_VKQ_max) {
@@ -269,9 +299,18 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
                 if (h >= GV) {
                     continue;
                 }
-                const uint4 qa = ((const uint4 *) &Q_s[h][8*l16])[0];
-                const uint4 qb = ((const uint4 *) &Q_s[h][8*l16])[1];
-                const uint32_t qw[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
+                uint32_t qw[8];
+                if constexpr (Q_reg) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        qw[i] = Q_r[h][i];
+                    }
+                } else {
+                    const uint4 qa = ((const uint4 *) &Q_s[h][8*l16])[0];
+                    const uint4 qb = ((const uint4 *) &Q_s[h][8*l16])[1];
+                    qw[0] = qa.x; qw[1] = qa.y; qw[2] = qa.z; qw[3] = qa.w;
+                    qw[4] = qb.x; qw[5] = qb.y; qw[6] = qb.z; qw[7] = qb.w;
+                }
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     v[h] = __builtin_amdgcn_fdot2(c[i], __builtin_bit_cast(fattn_dt3_h2, qw[i]), v[h], false);
@@ -319,7 +358,7 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
             if constexpr (NS == 8) {
                 sc += fattn_dt3_xor<8>(sc);
             }
-            S[p] = sc + __half2float(maskh[row0 + rr])*1.4426950408889634f;
+            S[p] = sc + mk[p];
         }
 
         // Online softmax over the tile, for head hs.
@@ -340,10 +379,16 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
         }
         tsum += fattn_dt3_xor<16>(tsum);
         KQ_sum = KQ_sum*alpha + tsum;
-        if (hs < GV && (NS == 16 || (lane & 8) == 0)) {
+        // P of rows 2p and 2p + 1 as an f16 pair, for the v_dot2 in PV
+        float S_odd[R/2];
+#pragma unroll
+        for (int p = 0; p < R/2; ++p) {
+            S_odd[p] = fattn_dt3_xor<16>(S[p]);
+        }
+        if (kr == 0 && hs < GV && (NS == 16 || (lane & 8) == 0)) {
 #pragma unroll
             for (int p = 0; p < R/2; ++p) {
-                P_s[warp][2*p + kr][hs] = S[p];
+                P_h[warp][p][hs] = fattn_dt3_h2{(_Float16) S[p], (_Float16) S_odd[p]};
             }
         }
 #pragma unroll
@@ -356,27 +401,33 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
         }
         fattn_dt3_wave_sync();
 
-        // O += P V (rotated domain)
-#pragma unroll 4
-        for (int rr = 0; rr < R; ++rr) {
-            const int base = rr*fattn_dt3_row_b;
-            const float    nV = __half2float(__ushort_as_half((unsigned short) (fattn_dt3_load_u32_a2(V_s, base + v_off_norm) & 0xFFFF)));
-            const uint32_t qs = fattn_dt3_load_u32_a2(V_s, base + v_off_qs);
-            const uint32_t sg = fattn_dt3_load_u32_a2(V_s, base + (v_off_signs & ~1)) >> (8*(v_off_signs & 1));
-            float vf[8];
+        // O += P V (rotated domain), 2 rows at a time: acc += (P_r nV_r, P_r+1 nV_r+1) . (v_r, v_r+1) with v_dot2.
+        const uint16_t * V_s16 = (const uint16_t *) V_s;
+        const uint8_t  * V_s8  = (const uint8_t  *) V_s;
+#pragma unroll 2
+        for (int p = 0; p < R/2; ++p) {
+            const int base0 = (2*p)*fattn_dt3_row_b;
+            const int base1 = base0 + fattn_dt3_row_b;
+            const fattn_dt3_h2 nV = {__builtin_bit_cast(_Float16, V_s16[(base0 + v_off_norm)/2]),
+                                     __builtin_bit_cast(_Float16, V_s16[(base1 + v_off_norm)/2])};
+            const uint32_t qs0 = V_s16[(base0 + v_off_qs)/2];
+            const uint32_t qs1 = V_s16[(base1 + v_off_qs)/2];
+            const uint32_t sg0 = V_s8[base0 + v_off_signs];
+            const uint32_t sg1 = V_s8[base1 + v_off_signs];
+            uint32_t vv[8]; // vv[i] = (dim i of row 2p, dim i of row 2p + 1)
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                const int idx = ((qs >> (4*i)) & 0xF) | (((sg >> (2*i)) & 3) << 4);
-                const float2 c = lutV[idx];
-                vf[2*i + 0] = c.x;
-                vf[2*i + 1] = c.y;
+                const uint32_t a = __builtin_bit_cast(uint32_t, lutK[((qs0 >> (4*i)) & 0xF) | (((sg0 >> (2*i)) & 3) << 4)]);
+                const uint32_t b = __builtin_bit_cast(uint32_t, lutK[((qs1 >> (4*i)) & 0xF) | (((sg1 >> (2*i)) & 3) << 4)]);
+                vv[2*i + 0] = __builtin_amdgcn_perm(b, a, 0x05040100);
+                vv[2*i + 1] = __builtin_amdgcn_perm(b, a, 0x07060302);
             }
 #pragma unroll
             for (int h = 0; h < GV; ++h) {
-                const float w = P_s[warp][rr][h]*nV;
+                const fattn_dt3_h2 w = P_h[warp][p][h]*nV;
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    acc[h][i] += w*vf[i];
+                    acc[h][i] = __builtin_amdgcn_fdot2(w, __builtin_bit_cast(fattn_dt3_h2, vv[i]), acc[h][i], false);
                 }
             }
         }
