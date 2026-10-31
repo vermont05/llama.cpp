@@ -2727,6 +2727,11 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
         return false;
     }
+
+    // the KV emulation hooks the plain SET_ROWS
+    if (ggml_cuda_kv_emu_active()) {
+        return false;
+    }
     // ne3 not tested
     if (rope->src[0]->ne[3] != 1) {
         return false;

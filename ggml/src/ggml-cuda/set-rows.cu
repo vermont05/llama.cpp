@@ -1,6 +1,9 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 
+#include <cinttypes>
+#include <cstring>
+
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
 // Generic quantized set_rows kernel template
@@ -373,12 +376,210 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
 }
 
 
+
+// ---- KV cache quantization emulation (see set-rows.cuh) ----
+
+enum kv_emu_mode { KV_EMU_NONE = 0, KV_EMU_Q4_0 = 1, KV_EMU_TURBO3 = 2 };
+
+static kv_emu_mode kv_emu_parse(const char * name) {
+    const char * v = getenv(name);
+    if (v == nullptr || v[0] == 0 || strcmp(v, "none") == 0) {
+        return KV_EMU_NONE;
+    }
+    if (strcmp(v, "q4_0") == 0) {
+        return KV_EMU_Q4_0;
+    }
+    if (strcmp(v, "turbo3") == 0) {
+        return KV_EMU_TURBO3;
+    }
+    GGML_ABORT("%s: unknown mode '%s' (q4_0, turbo3, none)", name, v);
+}
+
+static kv_emu_mode kv_emu_mode_k() { static const kv_emu_mode m = kv_emu_parse("PRISM_KV_EMU_K"); return m; }
+static kv_emu_mode kv_emu_mode_v() { static const kv_emu_mode m = kv_emu_parse("PRISM_KV_EMU_V"); return m; }
+
+bool ggml_cuda_kv_emu_active() {
+    return kv_emu_mode_k() != KV_EMU_NONE || kv_emu_mode_v() != KV_EMU_NONE;
+}
+
+// sign diagonals of the WHT, seed 42 (TURBO_WHT_SIGNS1/2 of the fork, = turbo_cpu_s1/s2)
+static __constant__ float kv_emu_s1[128] = {
+    -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
+    -1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,
+    -1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,
+    -1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1
+};
+static __constant__ float kv_emu_s2[128] = {
+    1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,
+    1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,
+    1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,
+    1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1
+};
+// 3-bit Lloyd-Max centroids for N(0, 1/128)
+static __constant__ float kv_emu_c3[8] = {
+    -0.190207f, -0.118786f, -0.066822f, -0.021663f, 0.021663f, 0.066822f, 0.118786f, 0.190207f
+};
+
+static __device__ int kv_emu_nearest3(const float v) {
+    if (v < -0.154496f) return 0;
+    if (v < -0.092804f) return 1;
+    if (v < -0.044243f) return 2;
+    if (v <  0.000000f) return 3;
+    if (v <  0.044243f) return 4;
+    if (v <  0.092804f) return 5;
+    if (v <  0.154496f) return 6;
+    return 7;
+}
+
+// sum of v over the 128 threads of the block
+static __device__ float kv_emu_sum128(float v, float * red) {
+    const int j = threadIdx.x;
+    red[j] = v;
+    __syncthreads();
+    for (int h = 64; h > 0; h >>= 1) {
+        if (j < h) {
+            red[j] += red[j + h];
+        }
+        __syncthreads();
+    }
+    const float res = red[0];
+    __syncthreads();
+    return res;
+}
+
+// x = D(sb) * H/sqrt(128) * D(sa) * x for the 128 values in x (in place, all threads)
+static __device__ void kv_emu_wht128(float * x, const float * sa, const float * sb) {
+    const int j = threadIdx.x;
+    x[j] *= sa[j];
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+        if ((j & h) == 0) {
+            const float a = x[j];
+            const float b = x[j + h];
+            x[j]     = a + b;
+            x[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+    x[j] *= 0.08838834764831845f * sb[j];
+    __syncthreads();
+}
+
+// one block of 128 threads per 128-value group of a row; dst is contiguous
+static __global__ void k_kv_emu(const char * __restrict__ src, float * __restrict__ dst, const int mode,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t nb01, const int64_t nb02, const int64_t nb03) {
+    const int     j     = threadIdx.x;
+    const int64_t n_grp = ne00 / 128;
+    int64_t       r     = blockIdx.x;
+    const int64_t i_grp = r % n_grp; r /= n_grp;
+    const int64_t i01   = r % ne01;  r /= ne01;
+    const int64_t i02   = r % ne02;
+    const int64_t i03   = r / ne02;
+
+    const float * s = (const float *) (src + i01*nb01 + i02*nb02 + i03*nb03) + i_grp*128;
+    float       * d = dst + ((i03*ne02 + i02)*ne01 + i01)*ne00 + i_grp*128;
+
+    __shared__ float x[128];
+    __shared__ float red[128];
+
+    x[j] = s[j];
+    __syncthreads();
+
+    if (mode == KV_EMU_Q4_0) {
+        // quantize_f32_q4_0_block and back, one thread per 32-value block
+        if (j < 4) {
+            block_q4_0 q;
+            quantize_f32_q4_0_block(x + j*QK4_0, &q);
+            const float qd = __half2float(q.d);
+            for (int k = 0; k < QK4_0/2; ++k) {
+                x[j*QK4_0 + k]           = ((q.qs[k] & 0x0F) - 8)*qd;
+                x[j*QK4_0 + k + QK4_0/2] = ((q.qs[k] >>   4) - 8)*qd;
+            }
+        }
+        __syncthreads();
+        d[j] = x[j];
+        return;
+    }
+
+    // turbo3: normalize, rotate, 3-bit centroids, corrected norm (f16), rotate back
+    const float norm     = sqrtf(kv_emu_sum128(x[j]*x[j], red));
+    const float inv_norm = norm > 1e-10f ? 1.0f/norm : 0.0f;
+    x[j] *= inv_norm;
+    __syncthreads();
+
+    kv_emu_wht128(x, kv_emu_s1, kv_emu_s2);
+
+    const float c        = kv_emu_c3[kv_emu_nearest3(x[j])];
+    const float rnorm    = sqrtf(kv_emu_sum128(c*c, red));
+    const float corr     = __half2float(__float2half(rnorm > 1e-10f ? norm/rnorm : norm));
+    x[j] = c*corr;
+    __syncthreads();
+
+    // inverse: D(s1) * H/sqrt(128) * D(s2)
+    kv_emu_wht128(x, kv_emu_s2, kv_emu_s1);
+
+    d[j] = x[j];
+}
+
+// true if the write went through the emulation
+static bool kv_emu_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F16 || !ggml_cuda_kv_emu_active()) {
+        return false;
+    }
+    const ggml_tensor * base = dst;
+    while (base->view_src) {
+        base = base->view_src;
+    }
+    const bool is_k = strncmp(base->name, "cache_k", 7) == 0;
+    const bool is_v = strncmp(base->name, "cache_v", 7) == 0;
+    const kv_emu_mode mode = is_k ? kv_emu_mode_k() : is_v ? kv_emu_mode_v() : KV_EMU_NONE;
+    if (mode == KV_EMU_NONE) {
+        return false;
+    }
+    // rows of whole heads (FA layout, V not transposed); 128-value groups never straddle a head of 128 or 256
+    GGML_ASSERT(src0->ne[0] % 128 == 0 && src0->nb[0] == sizeof(float) && "KV emulation needs rows of 128k values (flash attention)");
+
+    static bool logged[2] = { false, false };
+    if (!logged[is_v]) {
+        logged[is_v] = true;
+        GGML_LOG_WARN("%s: emulating %s for %s (row of %" PRId64 " values)\n", __func__,
+                mode == KV_EMU_Q4_0 ? "q4_0" : "turbo3", is_k ? "K" : "V", src0->ne[0]);
+    }
+
+    const int64_t n = ggml_nelements(src0);
+    ggml_cuda_pool_alloc<float> tmp(ctx.pool(), n);
+
+    const int64_t n_blocks = n / 128;
+    k_kv_emu<<<n_blocks, 128, 0, ctx.stream()>>>((const char *) src0->data, tmp.get(), mode,
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->nb[1], src0->nb[2], src0->nb[3]);
+    CUDA_CHECK(cudaGetLastError());
+
+    ggml_tensor src0c = *src0;
+    src0c.data  = tmp.get();
+    src0c.nb[0] = sizeof(float);
+    src0c.nb[1] = src0c.nb[0]*src0->ne[0];
+    src0c.nb[2] = src0c.nb[1]*src0->ne[1];
+    src0c.nb[3] = src0c.nb[2]*src0->ne[2];
+
+    if (src1->type == GGML_TYPE_I64) {
+        set_rows_cuda<float, int64_t>(ctx, &src0c, src1, dst);
+    } else {
+        set_rows_cuda<float, int32_t>(ctx, &src0c, src1, dst);
+    }
+    return true;
+}
+
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    if (kv_emu_set_rows(ctx, src0, src1, dst)) {
+        return;
+    }
 
     if (src0->type == GGML_TYPE_F32) {
         if (src1->type == GGML_TYPE_I64) {
