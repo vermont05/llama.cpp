@@ -572,6 +572,20 @@ struct fattn_turbo3_tile {
     static_assert(sizeof(block_turbo3_0) == 50, "bad block_turbo3_0");
 
     uint32_t W[nsteps][6];
+
+    // The block (0 or 1) of the 32 values that a thread converts in step s, iu = (s*nthreads + tid)/nbatch_fa: when
+    // all threads of a step are in the same block it is a constant, which removes the selects between the two block
+    // alignments and the extra load of block 0.
+    template <int nthreads_>
+    static __device__ __forceinline__ int block_of_step(const int s, const int iu) {
+        if constexpr (nthreads_ % nbatch_fa == 0) {
+            constexpr int iu_per_step = nthreads_/nbatch_fa;
+            if ((s*iu_per_step)/4 == ((s + 1)*iu_per_step - 1)/4) {
+                return (s*iu_per_step)/4;
+            }
+        }
+        return iu/4;
+    }
 };
 
 // the pair table, index = lo2(a) | lo2(b) << 2 | hi(a) << 4 | hi(b) << 5; filled at the start of the kernel
@@ -598,7 +612,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_fetch_tile_turbo3(
             }
             continue;
         }
-        const int b = iu / 4; // block of the row
+        const int b = T::template block_of_step<nwarps*warp_size>(s, iu); // block of the row
         const int q = iu % 4; // quarter of the block
         const uint32_t * w = (const uint32_t *) (KV + int64_t(i)*stride_KV);
         const int off = b*int(sizeof(block_turbo3_0));
@@ -630,7 +644,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_store_tile_turbo3(
         const int i  = (s*nwarps*warp_size + tid) % nbatch_fa;
         const int iu = (s*nwarps*warp_size + tid) / nbatch_fa;
         // block 0 starts on a word: its codes and high bits are 2 bytes into a word; block 1 starts 2 bytes into one
-        const bool b0 = iu < 4;
+        const bool b0 = T::template block_of_step<nwarps*warp_size>(s, iu) == 0;
 
         // Rows past the end were fetched as zeros: norm = 0 gives zeros.
         const uint16_t n_bits = b0 ? t.W[s][0] & 0xFFFF : t.W[s][0] >> 16;
