@@ -8,6 +8,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <random>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -714,6 +715,83 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_spec(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & q) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(q.size() == draft.size() && "one draft distribution per draft token");
+
+    static thread_local std::mt19937 rng(common_sampler_get_seed(gsmpl) ^ 0x5bd1e995u);
+    std::uniform_real_distribution<float> unif(0.0f, 1.0f);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // the sampler chain leaves the target distribution p in cur_p (its own sample is used only as a fallback)
+        const llama_token id_p = common_sampler_sample(gsmpl, ctx, idxs[i], false);
+        const llama_token_data_array & cur_p = gsmpl->cur_p;
+
+        auto q_of = [&](llama_token id) {
+            for (const auto & td : q[i]) {
+                if (td.id == id) {
+                    return td.p;
+                }
+            }
+            return 0.0f;
+        };
+
+        float p_d = 0.0f;
+        for (size_t k = 0; k < cur_p.size; ++k) {
+            if (cur_p.data[k].id == draft[i]) {
+                p_d = cur_p.data[k].p;
+                break;
+            }
+        }
+        const float q_d = q_of(draft[i]);
+
+        llama_token id = draft[i];
+        if (!(q_d > 0.0f && unif(rng)*q_d < p_d)) {
+            // rejected: sample from the residual max(0, p - q)
+            double w_sum = 0.0;
+            std::vector<float> w(cur_p.size);
+            for (size_t k = 0; k < cur_p.size; ++k) {
+                w[k] = std::max(0.0f, cur_p.data[k].p - q_of(cur_p.data[k].id));
+                w_sum += w[k];
+            }
+            id = id_p;
+            if (w_sum > 0.0) {
+                double r = unif(rng)*w_sum;
+                for (size_t k = 0; k < cur_p.size; ++k) {
+                    r -= w[k];
+                    if (r <= 0.0 && w[k] > 0.0f) {
+                        id = cur_p.data[k].id;
+                        break;
+                    }
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+
+        if (draft[i] != id) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], false);
 
         common_sampler_accept(gsmpl, id, true);
 

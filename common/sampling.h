@@ -88,6 +88,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// speculative sampling: like common_sampler_sample_and_accept_n, but draft[i] was sampled from the draft distribution
+// q[i]; it is accepted with probability min(1, p/q) under the target distribution p (the result of the sampler chain),
+// and on rejection a token is sampled from max(0, p - q), so the tokens follow p exactly. No grammar support.
+std::vector<llama_token> common_sampler_sample_and_accept_n_spec(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & q);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

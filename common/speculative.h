@@ -60,6 +60,12 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // speculative sampling (draft-mtp): with sampling set and temp > 0, each draft token is sampled from the draft
+    // distribution q (top-k/top-p/min-p/temp of these params) instead of taken greedily, and q of every drafted
+    // position is stored in result_q for the verification (common_sampler_sample_and_accept_n_spec)
+    const common_params_sampling * sampling = nullptr;
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

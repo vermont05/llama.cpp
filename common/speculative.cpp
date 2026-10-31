@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <random>
 #include <cassert>
 #include <cstring>
 #include <iomanip>
@@ -293,6 +294,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            if (dp.result_q) {
+                dp.result_q->clear();
+            }
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
         }
@@ -744,6 +748,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            if (dp.result_q) {
+                dp.result_q->clear();
+            }
 
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pending_pos_last[seq_id], -1);
 
@@ -1298,6 +1305,53 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// Draft distribution q for speculative sampling: the top-k logits (k from the request, at most 64), softmax at the
+// request temperature, then top-p and min-p, renormalized; sorted by probability, highest first.
+static std::vector<llama_token_data> common_speculative_draft_dist(const float * logits, int n_vocab, const common_params_sampling & sp) {
+    const int k = std::clamp(sp.top_k > 0 ? sp.top_k : 40, 1, 64);
+    std::vector<llama_token_data> c;
+    c.reserve(k + 1);
+    auto cmp = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; }; // min-heap on logit
+    for (int t = 0; t < n_vocab; ++t) {
+        if ((int) c.size() < k) {
+            c.push_back({t, logits[t], 0.0f});
+            std::push_heap(c.begin(), c.end(), cmp);
+        } else if (logits[t] > c.front().logit) {
+            std::pop_heap(c.begin(), c.end(), cmp);
+            c.back() = {t, logits[t], 0.0f};
+            std::push_heap(c.begin(), c.end(), cmp);
+        }
+    }
+    std::sort(c.begin(), c.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; });
+    const float temp = std::max(sp.temp, 1e-6f);
+    double sum = 0.0;
+    for (auto & td : c) {
+        td.p = expf((td.logit - c[0].logit)/temp);
+        sum += td.p;
+    }
+    size_t n = c.size();
+    double cum = 0.0;
+    for (size_t j = 0; j < c.size(); ++j) {
+        c[j].p /= sum;
+        cum += c[j].p;
+        if (sp.top_p < 1.0f && cum >= sp.top_p) {
+            n = std::min(n, j + 1);
+        }
+        if (sp.min_p > 0.0f && c[j].p < sp.min_p*c[0].p) {
+            n = std::min(n, std::max<size_t>(j, 1));
+        }
+    }
+    c.resize(n);
+    sum = 0.0;
+    for (const auto & td : c) {
+        sum += td.p;
+    }
+    for (auto & td : c) {
+        td.p /= sum;
+    }
+    return c;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1333,6 +1387,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+
+    std::mt19937 rng_spec{0x2545f491u}; // speculative sampling of the draft tokens
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1590,6 +1646,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            if (dp.result_q) {
+                dp.result_q->clear();
+            }
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1637,32 +1696,57 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 auto * smpl = smpls[seq_id].get();
+                auto & dp = dparams.at(seq_id);
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                llama_token id;
+                if (dp.sampling && dp.result_q && dp.sampling->temp > 0.0f) {
+                    // speculative sampling: sample the draft token from q and keep q for the verification
+                    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    auto qd = common_speculative_draft_dist(llama_get_logits_ith(ctx_dft, i_last[seq_id]), n_vocab, *dp.sampling);
+                    if (qd[0].p < params.p_min) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
 
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        continue;
+                    }
+                    std::uniform_real_distribution<float> unif(0.0f, 1.0f);
+                    float r = unif(rng_spec);
+                    id = qd.back().id;
+                    for (const auto & td : qd) {
+                        r -= td.p;
+                        if (r <= 0.0f) {
+                            id = td.id;
+                            break;
+                        }
+                    }
+                    dp.result_q->push_back(std::move(qd));
+                } else {
+                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    // add drafted token for each sequence
+                    id = cur_p->data[0].id;
+
+                    // only collect very high-confidence draft tokens
+                    if (cur_p->data[0].p < params.p_min) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
+
+                    common_sampler_accept(smpl, id, true);
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
-
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
-
-                    continue;
-                }
-
-                common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
@@ -1716,6 +1800,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }

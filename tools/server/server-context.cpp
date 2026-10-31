@@ -209,6 +209,7 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<std::vector<llama_token_data>> spec_draft_q; // draft distributions, with speculative sampling
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -406,6 +407,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -3280,6 +3282,13 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // LLAMA_SPEC_SAMPLING=1: speculative sampling (draft tokens sampled from the draft distribution,
+                        // accepted with probability min(1, p/q)) for sampled requests without a grammar
+                        static const bool spec_sampling = getenv("LLAMA_SPEC_SAMPLING") && atoi(getenv("LLAMA_SPEC_SAMPLING")) != 0;
+                        const auto & sp = slot.task->params.sampling;
+                        const bool use_spec_sampling = spec_sampling && sp.temp > 0.0f && sp.grammar.empty();
+                        slot.spec_draft_q.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -3287,6 +3296,8 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .sampling = */ use_spec_sampling ? &sp : nullptr,
+                            /* .result_q = */ use_spec_sampling ? &slot.spec_draft_q : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -4202,11 +4213,19 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // the copy is needed only if a checkpoint may be restored below (partial acceptance not supported)
+                const bool may_restore =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(slot.ctx_tgt));
+                common_sampler_ptr smpl_save(may_restore ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const bool spec_q = !slot.spec_draft_q.empty() && slot.spec_draft_q.size() == slot.spec_draft.size();
+                auto accepted = spec_q ?
+                    common_sampler_sample_and_accept_n_spec(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q) :
+                    common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
+                slot.spec_draft_q.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -4240,6 +4259,7 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        GGML_ASSERT(smpl_save);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;
