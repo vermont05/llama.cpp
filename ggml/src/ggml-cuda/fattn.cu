@@ -587,11 +587,22 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_K = false;
     bool need_f16_V = false;
 
+    // The RDNA3 prompt kernel reads q4_0 (PRISM_FA_Q4_DIRECT=1) and turbo3 K/V of head size 256 directly: no f16
+    // copy to reserve (~4 KiB per token of context for 4 KV heads). launch_fattn takes it from the pool if a launch
+    // needs it after all.
+    static const bool q4_direct = getenv("PRISM_FA_Q4_DIRECT") && atoi(getenv("PRISM_FA_Q4_DIRECT")) != 0;
+    const bool kv_direct = GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc) && K->ne[0] == 256 && V->ne[0] == 256 &&
+        dst->src[0]->ne[2] > K->ne[2] && K->type == V->type &&
+        ((q4_direct && K->type == GGML_TYPE_Q4_0) || K->type == GGML_TYPE_TURBO3_0);
+
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = !kv_direct;
+            need_f16_V = !kv_direct;
             break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;

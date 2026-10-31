@@ -1041,6 +1041,8 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<half>   K_f16_pool(pool); // the f16 copies when get_alloc_size did not reserve them
+    ggml_cuda_pool_alloc<half>   V_f16_pool(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1058,8 +1060,7 @@ void launch_fattn(
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
-        GGML_ASSERT(f16_extra.K != 0);
-        half * K_f16 = (half *) f16_extra.K;
+        half * K_f16 = f16_extra.K != 0 ? (half *) f16_extra.K : K_f16_pool.alloc(ggml_nelements(K));
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
@@ -1092,8 +1093,7 @@ void launch_fattn(
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
 
-            GGML_ASSERT(f16_extra.V != 0);
-            half * V_f16 = (half *) f16_extra.V;
+            half * V_f16 = f16_extra.V != 0 ? (half *) f16_extra.V : V_f16_pool.alloc(ggml_nelements(V));
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
