@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-decode-q4.cuh"
+#include "fattn-decode-turbo3.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -484,7 +485,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    // no vector kernel for turbo3: it goes to the tile/mma kernels, which read a f16 copy of K and V
+    // turbo3: single-token decode has its own kernel (dispatched in the VEC case); everything else goes to the
+    // tile/mma kernels, which read a f16 copy of K and V
+    if (ggml_cuda_flash_attn_ext_decode_turbo3_supported(dst)) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
     const bool turbo3 = K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0;
     const bool can_use_vector_kernel = !turbo3 && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
@@ -611,7 +616,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
-            if (ggml_cuda_flash_attn_ext_decode_q4_supported(dst)) {
+            if (ggml_cuda_flash_attn_ext_decode_turbo3_supported(dst)) {
+                ggml_cuda_flash_attn_ext_decode_turbo3(ctx, dst);
+            } else if (ggml_cuda_flash_attn_ext_decode_q4_supported(dst)) {
                 ggml_cuda_flash_attn_ext_decode_q4(ctx, dst);
             } else {
                 ggml_cuda_flash_attn_ext_vec(ctx, dst);
