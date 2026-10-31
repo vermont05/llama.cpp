@@ -3282,9 +3282,9 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
-                        // LLAMA_SPEC_SAMPLING=1: speculative sampling (draft tokens sampled from the draft distribution,
-                        // accepted with probability min(1, p/q)) for sampled requests without a grammar
-                        static const bool spec_sampling = getenv("LLAMA_SPEC_SAMPLING") && atoi(getenv("LLAMA_SPEC_SAMPLING")) != 0;
+                        // speculative sampling (draft tokens sampled from the draft distribution, accepted with
+                        // probability min(1, p/q)) for sampled requests without a grammar; LLAMA_SPEC_SAMPLING=0 disables it
+                        static const bool spec_sampling = !getenv("LLAMA_SPEC_SAMPLING") || atoi(getenv("LLAMA_SPEC_SAMPLING")) != 0;
                         const auto & sp = slot.task->params.sampling;
                         const bool use_spec_sampling = spec_sampling && sp.temp > 0.0f && sp.grammar.empty();
                         slot.spec_draft_q.clear();
