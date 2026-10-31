@@ -2646,7 +2646,89 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Graphs that alternate between shapes from the same memory (the MTP head: 2-token catch-up, then 1-token draft)
+    // would share one entry and reset each other's warmup; a small shape signature (the ne[1] of the first nodes, i.e.
+    // the token count) keeps them apart. The key is only compared, never dereferenced, and the offset (< 64) stays
+    // inside the first node, so it cannot collide with another graph's first node.
+    int64_t sig = 0;
+    for (int i = 0; i < std::min(cgraph->n_nodes, 4); ++i) {
+        sig = sig*31 + cgraph->nodes[i]->ne[1];
+    }
+    return (const char *) cgraph->nodes[0] + (uint64_t) sig % 61;
+}
+
+// Debug: GGML_CUDA_GRAPH_STATS=n reports, per graph size for graphs with >= n nodes, how often they run as a CUDA
+// graph, run directly (warmup after a property change) or are (re)captured, and the first node whose properties changed.
+static int ggml_cuda_graph_stats_min_nodes() {
+    static const int n = getenv("GGML_CUDA_GRAPH_STATS") ? std::max(0, atoi(getenv("GGML_CUDA_GRAPH_STATS"))) : 0;
+    return n;
+}
+static bool ggml_cuda_graph_stats_enabled() {
+    return ggml_cuda_graph_stats_min_nodes() > 0;
+}
+
+struct ggml_cuda_graph_stats {
+    int n_graph = 0, n_direct = 0, n_capture = 0, n_incompatible = 0, n_changed = 0;
+    std::map<std::string, int> changes; // "op name field" -> count
+};
+
+static ggml_cuda_graph_stats & ggml_cuda_graph_stats_get(int n_nodes) {
+    static std::map<int, ggml_cuda_graph_stats> st;
+    return st[n_nodes];
+}
+
+static void ggml_cuda_graph_stats_note_change(const ggml_cgraph * cgraph, int i, const ggml_cuda_graph::node_properties & a,
+        const ggml_cuda_graph::node_properties & b) {
+    if (cgraph->n_nodes < ggml_cuda_graph_stats_min_nodes()) {
+        return;
+    }
+    const ggml_tensor * t = cgraph->nodes[i];
+    std::string field = "node";
+    if (a.node.data != b.node.data) {
+        field = "data";
+    } else if (memcmp(a.node.ne, b.node.ne, sizeof(a.node.ne)) != 0) {
+        field = "ne";
+    } else if (memcmp(a.node.op_params, b.node.op_params, sizeof(a.node.op_params)) != 0) {
+        field = "op_params";
+    } else {
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (a.node_src_data_ptrs[j] != b.node_src_data_ptrs[j]) {
+                field = "src" + std::to_string(j) + ".data(" + (t->src[j] ? std::string(t->src[j]->name) : "") + ")";
+                break;
+            }
+            if (memcmp(a.node_src_ne[j], b.node_src_ne[j], sizeof(a.node_src_ne[j])) != 0) {
+                field = "src" + std::to_string(j) + ".ne(" + (t->src[j] ? std::string(t->src[j]->name) : "") + ")";
+                break;
+            }
+        }
+    }
+    ggml_cuda_graph_stats_get(cgraph->n_nodes).changes[std::string(ggml_op_name(t->op)) + " " + t->name + " " + field]++;
+}
+
+static void ggml_cuda_graph_stats_count(const ggml_cgraph * cgraph, bool compatible, bool changed, bool use_graph, bool capture) {
+    if (!ggml_cuda_graph_stats_enabled() || cgraph->n_nodes < ggml_cuda_graph_stats_min_nodes()) {
+        return;
+    }
+    auto & st = ggml_cuda_graph_stats_get(cgraph->n_nodes);
+    st.n_incompatible += !compatible;
+    st.n_changed      += changed;
+    st.n_graph        += use_graph && !capture;
+    st.n_capture      += use_graph && capture;
+    st.n_direct       += !use_graph;
+    if (st.n_graph + st.n_capture + st.n_direct >= 128) {
+        std::string top;
+        std::vector<std::pair<int, std::string>> v;
+        for (const auto & [k, c] : st.changes) {
+            v.push_back({c, k});
+        }
+        std::sort(v.rbegin(), v.rend());
+        for (size_t k = 0; k < v.size() && k < 4; ++k) {
+            top += " [" + std::to_string(v[k].first) + "x " + v[k].second + "]";
+        }
+        fprintf(stderr, "cuda graph stats (n_nodes %d): graph %d, capture %d, direct %d (incompatible %d, changed %d); first changes:%s\n",
+            cgraph->n_nodes, st.n_graph, st.n_capture, st.n_direct, st.n_incompatible, st.n_changed, top.c_str());
+        st = {};
+    }
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -2683,6 +2765,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (!res && ggml_cuda_graph_stats_enabled()) {
+                ggml_cuda_graph_stats_note_change(cgraph, i, graph->node_props[i], prop);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4970,10 +5055,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    bool stats_compatible = false, stats_changed = false;
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        stats_compatible = graph_compatible;
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            stats_changed = properties_changed;
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4997,6 +5085,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+    ggml_cuda_graph_stats_count(cgraph, stats_compatible, stats_changed, use_cuda_graph, cuda_graph_update_required);
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
