@@ -110,3 +110,9 @@ static __device__ void turbo3_dequantize_group(const block_turbo3_0 * __restrict
     dst[j] = ggml_cuda_cast<dst_t>(x[j]);
     __syncthreads();
 }
+
+// Rotate each 128-value group of the rows of x (f32, ne0 % 128 == 0, strides in bytes) by M (inverse = false) or
+// M^T (inverse = true) into the contiguous f32 y; y may be x if x is contiguous. For attention kernels that work in
+// the rotated domain: q.k = (Mq).(Mk), and the output of P (M V) is rotated back with M^T.
+void ggml_cuda_turbo3_rotate_rows(const char * x, float * y, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+        size_t nb1, size_t nb2, size_t nb3, bool inverse, cudaStream_t stream);
