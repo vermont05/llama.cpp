@@ -88,7 +88,9 @@ static __device__ __forceinline__ void fattn_dt3_wht(float * x, const int n_grp,
 #define PRISM_FA_DT3_WAVES_PER_EU 4
 #endif
 
-template <int G, int NQ> // NQ: Q tokens (1, or 2 for the MTP verify step)
+// G: Q heads per K/V head, NQ: Q tokens (1, or 2-3 for the MTP verify step), GH: Q heads per block (a divisor of G;
+// with GH < G the G/GH blocks of a K/V head each read it, so that 3 tokens still fit in 16 virtual heads)
+template <int G, int NQ, int GH = G>
 #ifdef GGML_USE_HIP
 __attribute__((amdgpu_flat_work_group_size(fattn_dt3_nwarps*WARP_SIZE, fattn_dt3_nwarps*WARP_SIZE), amdgpu_waves_per_eu(PRISM_FA_DT3_WAVES_PER_EU)))
 #else
@@ -118,14 +120,15 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
 #if defined(GGML_USE_HIP) && defined(RDNA)
     GGML_UNUSED_VARS(sinks, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, nb01, nb03,
-        ne10, ne13, ne31, ne32, nb32);
+        ne10, ne12, ne13, ne31, ne32, nb32);
 
     constexpr int D      = fattn_dt3_D;
     constexpr int nwarps = fattn_dt3_nwarps;
     constexpr int R      = fattn_dt3_rows;
     constexpr int RW     = fattn_dt3_row_w;
     // the NQ tokens x G heads are GV virtual heads, NS score slots per lane group (padding beyond GV)
-    constexpr int GV     = G*NQ;
+    constexpr int GV     = GH*NQ;
+    static_assert(G % GH == 0, "GH must divide G");
     constexpr int NS     = GV <= 8 ? 8 : 16;
     static_assert(GV <= 16, "too many Q heads per K/V head");
     static_assert(nwarps*WARP_SIZE == QK_TURBO3, "the rotations use one thread per value of a group");
@@ -134,9 +137,10 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
     const int lane = threadIdx.x;
     const int tid  = warp*WARP_SIZE + lane;
 
-    const int sequence = blockIdx.z / ne12;
-    const int head_kv  = blockIdx.z - sequence*ne12;
-    const int head0    = head_kv*G; // gqa_ratio == G, checked on the host
+    // blockIdx.z = sequence*(ne02/GH) + head group, as in launch_fattn with ncols2 = GH (gqa_ratio == G, checked on the host)
+    const int sequence = blockIdx.z / (ne02/GH);
+    const int head0    = blockIdx.z*GH - sequence*ne02;
+    const int head_kv  = head0 / G;
 
     Q += nb03*sequence + int64_t(nb02)*head0;
     K += nb13*sequence + int64_t(nb12)*head_kv;
@@ -164,7 +168,7 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
     for (int t = tid; t < GV*D; t += nwarps*WARP_SIZE) {
         const int vh = t / D; // token vh / G, head vh % G
         const int d  = t - vh*D;
-        X_s[vh][d] = ((const float *) (Q + int64_t(nb01)*(vh / G) + int64_t(nb02)*(vh % G)))[d]*scale_l2;
+        X_s[vh][d] = ((const float *) (Q + int64_t(nb01)*(vh / GH) + int64_t(nb02)*(vh % GH)))[d]*scale_l2;
     }
     __syncthreads();
     fattn_dt3_wht(&X_s[0][0], GV*D/QK_TURBO3, turbo3_wht_s1, turbo3_wht_s2, tid);
@@ -201,7 +205,7 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
     // Softmax role: after the reduce-scatter, lane holds the score of virtual head hs = lane % NS (>= GV is padding)
     // of row 2*p + kr; with NS == 8 lanes l and l + 8 hold the same values.
     const int hs = lane % NS;
-    const half * maskh = (const half *) (mask + nb33*(sequence % ne33) + int64_t(nb31)*(hs < GV ? hs / G : 0));
+    const half * maskh = (const half *) (mask + nb33*(sequence % ne33) + int64_t(nb31)*(hs < GV ? hs / GH : 0));
     float KQ_max = -FLT_MAX/2.0f;
     float KQ_sum = 0.0f;
 
@@ -238,16 +242,17 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
         for (int p = 0; p < R/2; ++p) {
             pm[p] = ((const uint16_t *) maskh)[row0_load + 2*p + kr];
         }
-        const char * K_t = K + int64_t(row0_load)*nb11;
-        const char * V_t = V + int64_t(row0_load)*nb21;
+        // 32-bit offsets from the block's (uniform) K/V pointers: scalar-base global loads, no 64-bit address math
+        const uint32_t k_row = uint32_t(row0_load)*uint32_t(nb11);
+        const uint32_t v_row = uint32_t(row0_load)*uint32_t(nb21);
 #pragma unroll
         for (int j = 0; j < fattn_dt3_nld; ++j) {
             const int i = j*WARP_SIZE + lane;
             if (j < fattn_dt3_nld - 1 || i < fattn_dt3_tile_w) { // only the last load is partial
-                const int r = i / RW;
-                const int c = i - r*RW;
-                pk[j] = ((const uint32_t *) (K_t + r*nb11))[c];
-                pv[j] = ((const uint32_t *) (V_t + r*nb21))[c];
+                const uint32_t r = uint32_t(i) / RW;
+                const uint32_t c = uint32_t(i) - r*RW;
+                pk[j] = *(const uint32_t *) (K + (k_row + r*uint32_t(nb11) + 4*c));
+                pv[j] = *(const uint32_t *) (V + (v_row + r*uint32_t(nb21) + 4*c));
             }
         }
     };
@@ -391,12 +396,15 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
                 P_h[warp][p][hs] = fattn_dt3_h2{(_Float16) S[p], (_Float16) S_odd[p]};
             }
         }
+        // at depth the maxima rarely change: rescale only when one of them did
+        if (__builtin_amdgcn_ballot_w32(hs < GV && alpha != 1.0f)) {
 #pragma unroll
-        for (int h = 0; h < GV; ++h) {
-            const float alpha_h = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(alpha), h));
+            for (int h = 0; h < GV; ++h) {
+                const float alpha_h = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(alpha), h));
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                acc[h][i] *= alpha_h;
+                for (int i = 0; i < 8; ++i) {
+                    acc[h][i] *= alpha_h;
+                }
             }
         }
         fattn_dt3_wave_sync();
@@ -483,10 +491,10 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
         if (gridDim.y == 1) {
             val /= L[vh];
         }
-        dst[(((int64_t(sequence)*int(ne01.z) + vh / G)*ne02 + head0 + vh % G)*gridDim.y + blockIdx.y)*D + dim] = val;
+        dst[(((int64_t(sequence)*int(ne01.z) + vh / GH)*ne02 + head0 + vh % GH)*gridDim.y + blockIdx.y)*D + dim] = val;
     }
     if (gridDim.y != 1 && tid < GV) {
-        dst_meta[((int64_t(sequence)*int(ne01.z) + tid / G)*ne02 + head0 + tid % G)*gridDim.y + blockIdx.y] =
+        dst_meta[((int64_t(sequence)*int(ne01.z) + tid / GH)*ne02 + head0 + tid % GH)*gridDim.y + blockIdx.y] =
             make_float2(M[tid]*0.6931471805599453f, L[tid]); // combine works in base e
     }
 #else
@@ -523,7 +531,7 @@ bool ggml_cuda_flash_attn_ext_decode_turbo3_supported(const ggml_tensor * dst) {
     if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_TURBO3_0 || V->type != GGML_TYPE_TURBO3_0) {
         return false;
     }
-    if (Q->ne[0] != fattn_dt3_D || K->ne[0] != fattn_dt3_D || V->ne[0] != fattn_dt3_D || Q->ne[1] > 2) {
+    if (Q->ne[0] != fattn_dt3_D || K->ne[0] != fattn_dt3_D || V->ne[0] != fattn_dt3_D || Q->ne[1] > 3) {
         return false;
     }
     if (!mask || sinks || max_bias != 0.0f || logit_softcap != 0.0f || mask->type != GGML_TYPE_F16) {
@@ -539,8 +547,14 @@ bool ggml_cuda_flash_attn_ext_decode_turbo3_supported(const ggml_tensor * dst) {
     if (Q->ne[1] == 2 && gqa_ratio == 8) {
         return false; // 16 virtual heads spill (256 VGPRs + scratch)
     }
+    if (Q->ne[1] == 3 && gqa_ratio != 6) {
+        return false; // 3 tokens: only 2 blocks x 3 heads per K/V head
+    }
     if ((uintptr_t) K->data % 4 != 0 || (uintptr_t) V->data % 4 != 0 || (uintptr_t) Q->data % 16 != 0) {
         return false;
+    }
+    if (uint64_t(K->ne[1])*K->nb[1] >= (uint64_t(1) << 32) || uint64_t(V->ne[1])*V->nb[1] >= (uint64_t(1) << 32)) {
+        return false; // the K/V rows of one head are addressed with 32-bit offsets
     }
     for (int i = 1; i < GGML_MAX_DIMS; ++i) {
         if (K->nb[i] % 4 != 0 || V->nb[i] % 4 != 0 || Q->nb[i] % 16 != 0) {
@@ -554,10 +568,10 @@ bool ggml_cuda_flash_attn_ext_decode_turbo3_supported(const ggml_tensor * dst) {
 #endif // GGML_USE_HIP
 }
 
-template <int G, int NQ>
+template <int G, int NQ, int GH = G>
 static void ggml_cuda_flash_attn_ext_decode_turbo3_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    fattn_kernel_t fattn_kernel = flash_attn_ext_decode_turbo3_0<G, NQ>;
-    launch_fattn<fattn_dt3_D, NQ, G>(ctx, dst, fattn_kernel, fattn_dt3_nwarps, 0, fattn_dt3_tile, false, false, false);
+    fattn_kernel_t fattn_kernel = flash_attn_ext_decode_turbo3_0<G, NQ, GH>;
+    launch_fattn<fattn_dt3_D, NQ, GH>(ctx, dst, fattn_kernel, fattn_dt3_nwarps, 0, fattn_dt3_tile, false, false, false);
 }
 
 void ggml_cuda_flash_attn_ext_decode_turbo3(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -569,6 +583,7 @@ void ggml_cuda_flash_attn_ext_decode_turbo3(ggml_backend_cuda_context & ctx, ggm
         case 81: ggml_cuda_flash_attn_ext_decode_turbo3_case<8, 1>(ctx, dst); break;
         case 42: ggml_cuda_flash_attn_ext_decode_turbo3_case<4, 2>(ctx, dst); break;
         case 62: ggml_cuda_flash_attn_ext_decode_turbo3_case<6, 2>(ctx, dst); break;
+        case 63: ggml_cuda_flash_attn_ext_decode_turbo3_case<6, 3, 3>(ctx, dst); break;
         default: GGML_ABORT("unsupported gqa ratio / token count");
     }
 }
