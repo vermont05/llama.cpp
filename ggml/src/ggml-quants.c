@@ -2202,6 +2202,91 @@ size_t quantize_pq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 // 48-byte qs this reduces to exactly its original 32-then-16 behaviour.
 static const size_t ptq1_0_stages[3] = {32, 16, 8};
 
+// TURBO3_0 (see ggml-common.h)
+
+// x = D(sb) * H/sqrt(128) * D(sa) * x
+static void turbo3_wht(float * x, const float * sa, const float * sb) {
+    for (int i = 0; i < QK_TURBO3; i++) {
+        x[i] *= sa[i];
+    }
+    for (int h = 1; h < QK_TURBO3; h *= 2) {
+        for (int i = 0; i < QK_TURBO3; i += 2*h) {
+            for (int j = i; j < i + h; j++) {
+                const float a = x[j];
+                const float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < QK_TURBO3; i++) {
+        x[i] *= 0.08838834764831845f * sb[i];
+    }
+}
+
+void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO3 == 0);
+    const int64_t nb = k / QK_TURBO3;
+
+    for (int64_t ib = 0; ib < nb; ib++) {
+        float buf[QK_TURBO3];
+        float norm_sq = 0.0f;
+        for (int j = 0; j < QK_TURBO3; j++) {
+            buf[j]   = x[ib*QK_TURBO3 + j];
+            norm_sq += buf[j]*buf[j];
+        }
+        const float norm     = sqrtf(norm_sq);
+        const float inv_norm = norm > 1e-10f ? 1.0f/norm : 0.0f;
+        for (int j = 0; j < QK_TURBO3; j++) {
+            buf[j] *= inv_norm;
+        }
+
+        turbo3_wht(buf, turbo3_wht_s1, turbo3_wht_s2);
+
+        memset(y[ib].qs,    0, sizeof(y[ib].qs));
+        memset(y[ib].signs, 0, sizeof(y[ib].signs));
+        float recon_sq = 0.0f;
+        for (int j = 0; j < QK_TURBO3; j++) {
+            int idx = 0;
+            while (idx < 7 && buf[j] >= turbo3_midpoints[idx]) {
+                idx++;
+            }
+            y[ib].qs[j/4] |= (idx & 3) << (2*(j%4));
+            if (idx & 4) {
+                y[ib].signs[j/8] |= 1 << (j%8);
+            }
+            recon_sq += turbo3_centroids[idx]*turbo3_centroids[idx];
+        }
+        const float recon_norm = sqrtf(recon_sq);
+        y[ib].norm = GGML_FP32_TO_FP16(recon_norm > 1e-10f ? norm/recon_norm : norm);
+    }
+}
+
+void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO3 == 0);
+    const int64_t nb = k / QK_TURBO3;
+
+    for (int64_t ib = 0; ib < nb; ib++) {
+        const float norm = GGML_FP16_TO_FP32(x[ib].norm);
+        float * out = y + ib*QK_TURBO3;
+        for (int j = 0; j < QK_TURBO3; j++) {
+            const int idx = ((x[ib].qs[j/4] >> (2*(j%4))) & 3) | (((x[ib].signs[j/8] >> (j%8)) & 1) << 2);
+            out[j] = turbo3_centroids[idx]*norm;
+        }
+        // inverse rotation: D(s1) * H/sqrt(128) * D(s2)
+        turbo3_wht(out, turbo3_wht_s2, turbo3_wht_s1);
+    }
+}
+
+size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    const size_t row_size = ggml_row_size(GGML_TYPE_TURBO3_0, n_per_row);
+    for (int64_t row = 0; row < nrow; row++) {
+        quantize_row_turbo3_0_ref(src + row*n_per_row, (block_turbo3_0 *) ((char *) dst + row*row_size), n_per_row);
+    }
+    return nrow*row_size;
+}
+
 void quantize_row_ptq1_0_ref(const float * GGML_RESTRICT x, block_ptq1_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_PTQ1_0 == 0);
     const int64_t nb = k / QK_PTQ1_0;
@@ -5715,6 +5800,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_PTQ1_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_ptq1_0, data, nb);
+            } break;
+        case GGML_TYPE_TURBO3_0:
+            {
+                const block_turbo3_0 * q = (const block_turbo3_0 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i)) {
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {

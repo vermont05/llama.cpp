@@ -8,6 +8,7 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
+#include "ggml-quants.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
@@ -212,6 +213,23 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+// TURBO3_0 x f32 (CPU reference: dequantize, which undoes the rotation, then dot)
+static void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    const float          * y = (const float *) vy;
+    float sum = 0.0f;
+    float buf[QK_TURBO3];
+    for (int ib = 0; ib < n/QK_TURBO3; ib++) {
+        dequantize_row_turbo3_0(x + ib, buf, QK_TURBO3);
+        for (int j = 0; j < QK_TURBO3; j++) {
+            sum += buf[j]*y[ib*QK_TURBO3 + j];
+        }
+    }
+    *s = sum;
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -241,6 +259,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_pq2_0,
         .vec_dot                  = ggml_vec_dot_pq2_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo3_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_PTQ1_0] = {

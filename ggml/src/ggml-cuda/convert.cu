@@ -1,4 +1,5 @@
 #include "convert.cuh"
+#include "turbo3.cuh"
 #include "dequantize.cuh"
 
 #include <cstdint>
@@ -640,8 +641,42 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     }
 }
 
+
+// TURBO3_0 -> f16/f32, undoing the rotation: one block of 128 threads per group, blockIdx.x = group within the row
+template <typename dst_t>
+static __global__ void dequantize_block_turbo3(const void * __restrict__ vx, dst_t * __restrict__ y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne0203, const int64_t s01, const int64_t s02, const int64_t s03, const int64_t ne02) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const int64_t i02 = i0203 % ne02;
+            const int64_t i03 = i0203 / ne02;
+            turbo3_dequantize_group(x + i03*s03 + i02*s02 + i01*s01 + blockIdx.x, y + (i0203*ne01 + i01)*ne00 + int64_t(blockIdx.x)*QK_TURBO3);
+        }
+    }
+}
+
+template <typename dst_t>
+static void dequantize_block_turbo3_cuda(const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_TURBO3 == 0);
+    const int64_t ne0203 = ne02*ne03;
+    const dim3 num_blocks(ne00/QK_TURBO3, (int) std::min(ne01, (int64_t) 65535), (int) std::min(ne0203, (int64_t) 65535));
+    dequantize_block_turbo3<<<num_blocks, TURBO3_THREADS, 0, stream>>>(vx, y, ne00, ne01, ne0203, s01, s02, s03, ne02);
+}
+
+template <typename dst_t>
+static void dequantize_row_turbo3_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    // as rows of 128 values, so that the grid stays within limits
+    const int64_t nb = k/QK_TURBO3;
+    dequantize_block_turbo3_cuda(vx, y, QK_TURBO3, nb, 1, 1, 1, nb, nb, stream);
+}
+
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_cuda<half>;
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -710,6 +745,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_cuda<float>;
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -775,6 +812,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
 
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_block_turbo3_cuda<half>;
         case GGML_TYPE_F32:
             return convert_unary_cuda<float>;
         case GGML_TYPE_Q1_0:
@@ -833,6 +872,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
 
 to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_block_turbo3_cuda<float>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, float>;
         case GGML_TYPE_Q1_0:

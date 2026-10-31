@@ -319,10 +319,14 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
         }
 
+        // turbo3 rotates its 128-value groups itself (WHT); LLAMA_ATTN_ROT_TURBO3=1 adds this rotation on top
+        const char * LLAMA_ATTN_ROT_TURBO3 = getenv("LLAMA_ATTN_ROT_TURBO3");
+        const bool attn_rot_turbo3 = LLAMA_ATTN_ROT_TURBO3 ? atoi(LLAMA_ATTN_ROT_TURBO3) : false;
+
         attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
-            ggml_is_quantized(type_k) &&
+            ggml_is_quantized(type_k) && (type_k != GGML_TYPE_TURBO3_0 || attn_rot_turbo3) &&
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
@@ -335,7 +339,7 @@ llama_kv_cache::llama_kv_cache(
         attn_rot_v =
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
-            ggml_is_quantized(type_v) &&
+            ggml_is_quantized(type_v) && (type_v != GGML_TYPE_TURBO3_0 || attn_rot_turbo3) &&
             hparams.n_embd_head_v() % 64 == 0;
     }
 

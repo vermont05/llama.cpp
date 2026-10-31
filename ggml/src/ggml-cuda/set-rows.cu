@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "turbo3.cuh"
 
 #include <cinttypes>
 #include <cstring>
@@ -111,6 +112,42 @@ static void set_rows_cuda_quant(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
             ne01_fd, ne02_fd, ne11_fd, ne12_fd);
     }
+}
+
+// TURBO3_0: one block of 128 threads per 128-value group
+template <typename idx_t>
+static __global__ void k_set_rows_turbo3(const float * __restrict__ src0, const idx_t * __restrict__ src1, char * __restrict__ dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne11, const int64_t ne12,
+        const int64_t s01, const int64_t s02, const int64_t s03, const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t s1, const int64_t s2, const int64_t s3) {
+    const int64_t n_grp = ne00 / QK_TURBO3;
+    int64_t       r     = blockIdx.x;
+    const int64_t i_grp = r % n_grp; r /= n_grp;
+    const int64_t i01   = r % ne01;  r /= ne01;
+    const int64_t i02   = r % ne02;
+    const int64_t i03   = r / ne02;
+
+    const int64_t dst_row = src1[i01*s10 + (i02 % ne11)*s11 + (i03 % ne12)*s12];
+
+    const float    * x = src0 + i01*s01 + i02*s02 + i03*s03 + i_grp*QK_TURBO3;
+    block_turbo3_0 * y = (block_turbo3_0 *) (dst + dst_row*s1 + i02*s2 + i03*s3) + i_grp;
+
+    turbo3_quantize_group(x, y);
+}
+
+template <typename idx_t>
+static void set_rows_cuda_turbo3(const float * src0_d, const idx_t * src1_d, char * dst_d,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03, const int64_t ne11, const int64_t ne12,
+        const size_t nb01, const size_t nb02, const size_t nb03, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_TURBO3 == 0);
+    const int64_t n_groups = ne00/QK_TURBO3 * ne01 * ne02 * ne03;
+    if (n_groups == 0) {
+        return;
+    }
+    k_set_rows_turbo3<idx_t><<<n_groups, TURBO3_THREADS, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne11, ne12,
+        nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float), nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),
+        nb1, nb2, nb3);
 }
 
 template <typename src_t, typename idx_t, typename dst_t>
@@ -260,6 +297,13 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_TURBO3_0) {
+        if constexpr (std::is_same_v<src_t, float>) {
+            set_rows_cuda_turbo3<idx_t>(src0_d, src1_d, (char *) dst->data, ne00, ne01, ne02, ne03, ne11, ne12,
+                nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        } else {
+            GGML_ABORT("turbo3 set_rows needs f32 rows");
+        }
     } else if (dst->type == GGML_TYPE_Q4_0) {
         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
             src0_d, src1_d, (block_q4_0*)dst->data,

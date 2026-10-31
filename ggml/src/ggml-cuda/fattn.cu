@@ -377,6 +377,8 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
             return true;
+        case GGML_TYPE_TURBO3_0:
+            return true; // through the f16 copy (to_fp16 undoes the rotation), see can_use_vector_kernel
         default:
             return false;
     }
@@ -482,7 +484,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // no vector kernel for turbo3: it goes to the tile/mma kernels, which read a f16 copy of K and V
+    const bool turbo3 = K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0;
+    const bool can_use_vector_kernel = !turbo3 && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

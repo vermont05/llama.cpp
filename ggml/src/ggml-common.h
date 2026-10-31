@@ -219,6 +219,19 @@ typedef struct {
 } block_ptq1_0;
 static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
 
+// TURBO3_0: KV-cache-only TurboQuant 3-bit (TheTom/llama-cpp-turboquant, arXiv 2504.19874), same block layout.
+// A group of 128 values is normalized, rotated by D(s2) * H/sqrt(128) * D(s1) (H the Walsh-Hadamard butterfly),
+// and each rotated value is coded as the nearest of 8 Lloyd-Max centroids for N(0, 1/128). norm is the group norm
+// divided by the norm of the coded centroids, so a decoded group has the original norm. Unlike the fork, to_float
+// undoes the rotation (dequantize = reconstruct); attention kernels may work in the rotated domain instead.
+#define QK_TURBO3 128
+typedef struct {
+    ggml_half norm;              // corrected group norm
+    uint8_t   qs[QK_TURBO3 / 4]; // low 2 bits of the centroid index, 4 per byte
+    uint8_t   signs[QK_TURBO3 / 8]; // high bit of the centroid index, 8 per byte
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == sizeof(ggml_half) + QK_TURBO3/4 + QK_TURBO3/8, "wrong turbo3_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -1145,6 +1158,29 @@ GGML_TABLE_BEGIN(uint32_t, iq3s_grid, 512)
 GGML_TABLE_END()
 
 // TODO: fix name to kvalues_iq4_nl
+// TURBO3_0: WHT sign diagonals (seed 42), 3-bit centroids and their midpoints
+GGML_TABLE_BEGIN(float, turbo3_wht_s1, 128)
+    -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
+    -1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,
+    -1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,
+    -1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo3_wht_s2, 128)
+    1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,
+    1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,
+    1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,
+    1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo3_centroids, 8)
+    -0.190207f, -0.118786f, -0.066822f, -0.021663f, 0.021663f, 0.066822f, 0.118786f, 0.190207f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, turbo3_midpoints, 7)
+    -0.154496f, -0.092804f, -0.044243f, 0.0f, 0.044243f, 0.092804f, 0.154496f,
+GGML_TABLE_END()
+
 GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()
