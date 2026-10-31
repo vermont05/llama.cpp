@@ -622,6 +622,7 @@ struct common_params {
     bool    checkpoint_spread   = false; // evict the checkpoint that leaves the smallest gap for its distance from the end
     int32_t cache_save_min      = 0;     // save a slot's prompt before another one takes the slot if it loses this many tokens (0 = only more than half)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t cache_disk_mib      = 32768; // size limit of the disk level of the prompt cache, -1 = no limit, 0 = disable
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -681,6 +682,7 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    std::string cache_disk_path; // directory of the disk level of the prompt cache, empty = disabled
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

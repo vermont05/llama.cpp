@@ -164,6 +164,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `--cache-disk PATH` | directory for the disk level of the prompt cache: prompts evicted from --cache-ram are written there and loaded back when a later request shares their prefix, also after a restart (default: disabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_DISK) |
+| `--cache-disk-size N` | set the maximum size of the --cache-disk directory in MiB (default: 32768, -1 - no limit)<br/>(env: LLAMA_ARG_CACHE_DISK_SIZE) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -327,6 +329,17 @@ services:
       LLAMA_ARG_ENDPOINT_METRICS: 1
       LLAMA_ARG_PORT: 8080
 ```
+
+### Prompt cache on disk
+
+With `--cache-disk PATH`, the prompt cache (`--cache-ram`) gets a second level on disk. A prompt state that the RAM level evicts is written to a file in `PATH` by a background thread instead of being dropped. When a later request shares a longer prefix with a file than with any slot or RAM entry, the state is read back, together with its context checkpoints. On exit (and before the server sleeps) the idle slots and the RAM entries are written as well, and on startup the files are indexed again, so the cache outlives the process.
+
+- File names start with a fingerprint of the model, mmproj, draft model, LoRA and control vector files and of the settings that change the KV contents (KV cache types, RoPE/YaRN, metadata overrides), so several models and configurations can share one directory. Files of other fingerprints are never loaded.
+- `--cache-disk-size` limits all files in the directory, including those of other fingerprints; the least recently used file is removed first. 5% of the file system (at least 1 GiB) is always left free. `--cache-disk-size 0` disables the disk level.
+- A state is written once: nothing is written if a file already holds the same tokens or a continuation of them, and a file whose tokens are a prefix of a new one is removed.
+- States larger than `--cache-ram` are not cached, as without the disk level. States waiting to be written may hold about half of `--cache-ram` on top of it; when the disk is slower than that, the oldest waiting states are dropped.
+- A file whose state does not restore (for example no free cells in a unified KV cache) is kept, and skipped after the second failure.
+- Writing on exit can take a while for large states. In router mode, raise `stop-timeout` of the model preset, else the router stops the instance before the files are complete (incomplete files are removed on the next start). Before sleeping, the states are only handed to the writer thread.
 
 ### Multimodal support
 
