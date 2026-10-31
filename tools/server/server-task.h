@@ -598,6 +598,10 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // a root entry (server_slot::prompt_save_root): a conversation cut back to its shared prefix or system prompt,
+    // small and evicted last, restored by copy
+    bool root = false;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -627,6 +631,22 @@ struct server_prompt_cache {
     // checkpoint within the common prefix, see n_usable()
     bool rolls_back_to_checkpoints = false;
 
+    // not evicted while the slot is saved: the entry the next prompt resumes from, see protect()
+    const server_prompt_cache_state * protected_state = nullptr;
+
+    // protect the entry that restores the most of tokens until the next update()
+    void protect(const server_tokens & tokens);
+
+    // the longest common prefix of tokens with a cached prompt, restorable or not
+    size_t n_common_prefix(const server_tokens & tokens) const;
+
+    // the size of the root entries, at most half of limit_size
+    size_t size_root() const;
+
+    // the entry to evict to make room: the oldest one that is not protected, a root only if there is no other, end()
+    // if there is none
+    std::list<server_prompt_cache_state>::iterator victim();
+
     // the prefix of a new prompt that a state restores, given their common prefix lcp: all of it, or, for a memory that
     // rolls back only to checkpoints, the newest checkpoint within it (all of it if the state is a prefix of the new one)
     size_t n_usable(const server_prompt & prompt, size_t lcp) const;
@@ -635,7 +655,7 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, bool root = false);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

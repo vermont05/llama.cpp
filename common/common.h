@@ -1151,6 +1151,14 @@ struct common_prompt_checkpoint {
     // at the end of the system prompt, kept for good (--checkpoint-root)
     bool root = false;
 
+    // at the end of the prefix this prompt shares with an earlier one (the slot's or a cached one), kept like the
+    // root: a later conversation that shares that prefix resumes here, e.g. a run of the same tools and system
+    // prompt in another directory (--checkpoint-root)
+    bool shared = false;
+
+    // not evicted to make room for other checkpoints
+    bool kept() const { return root || shared; }
+
     llama_pos pos_min;
     llama_pos pos_max;
 
