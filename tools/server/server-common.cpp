@@ -9,6 +9,8 @@
 
 #include "server-common.h"
 
+#include <cstring>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -234,6 +236,90 @@ static inline raw_buffer base64_decode(const std::string & encoded_string) {
 // server_tokens implementation
 //
 
+namespace {
+
+constexpr uint32_t SERVER_TOKENS_STATE_VERSION = 1;
+
+uint32_t server_tokens_state_u32(size_t value) {
+    if (value > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("Server tokens state is too large");
+    }
+    return value;
+}
+
+class server_tokens_state_writer {
+public:
+    template <typename T>
+    void write(T value) {
+        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
+        const auto * ptr = reinterpret_cast<const char *>(&value);
+        data.insert(data.end(), ptr, ptr + sizeof(value));
+    }
+
+    template <typename T>
+    void write(const std::vector<T> & values) {
+        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
+        write(server_tokens_state_u32(values.size()));
+        if (values.empty()) {
+            return;
+        }
+        const auto * ptr = reinterpret_cast<const char *>(values.data());
+        data.insert(data.end(), ptr, ptr + values.size() * sizeof(T));
+    }
+
+    std::vector<char> take() {
+        data.resize((data.size() + sizeof(llama_token) - 1) / sizeof(llama_token) * sizeof(llama_token), 0);
+        return std::move(data);
+    }
+
+private:
+    std::vector<char> data;
+};
+
+class server_tokens_state_reader {
+public:
+    server_tokens_state_reader(const char * data, size_t size) : data(data), size(size) {}
+
+    template <typename T>
+    T read() {
+        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
+        if (size - pos < sizeof(T)) {
+            throw std::runtime_error("Unexpected end of server tokens state");
+        }
+        T value;
+        std::memcpy(&value, data + pos, sizeof(value));
+        pos += sizeof(value);
+        return value;
+    }
+
+    template <typename T>
+    std::vector<T> read_vector() {
+        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
+        const uint32_t n_values = read<uint32_t>();
+        // reject before resizing, so that a small corrupted payload cannot request a huge allocation
+        if (n_values > remaining() / sizeof(T)) {
+            throw std::runtime_error("Unexpected end of server tokens state");
+        }
+        std::vector<T> values(n_values);
+        if (n_values > 0) {
+            std::memcpy(values.data(), data + pos, values.size() * sizeof(T));
+            pos += values.size() * sizeof(T);
+        }
+        return values;
+    }
+
+    size_t remaining() const {
+        return size - pos;
+    }
+
+private:
+    const char * data;
+    size_t size;
+    size_t pos = 0;
+};
+
+} // namespace
+
 server_tokens::server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd) : has_mtmd(has_mtmd) {
     for (size_t i = 0; i < mtmd_chunks.size(); ++i) {
         push_back(mtmd_chunks[i]);
@@ -397,6 +483,50 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 const llama_tokens & server_tokens::get_tokens() const {
     GGML_ASSERT(!has_mtmd);
     return tokens;
+}
+
+std::vector<char> server_tokens::serialize() const {
+    static_assert(sizeof(llama_token) == sizeof(uint32_t), "unexpected llama_token size");
+
+    if (!map_idx_to_media.empty()) {
+        throw std::runtime_error("Cannot serialize media chunks in server tokens");
+    }
+
+    // same layout as prism-tune: marker, version, tokens, media keys (always none here)
+    server_tokens_state_writer writer;
+    writer.write((llama_token) LLAMA_TOKEN_NULL);
+    writer.write(SERVER_TOKENS_STATE_VERSION);
+    writer.write(tokens);
+    writer.write(std::vector<uint32_t>());
+
+    return writer.take();
+}
+
+server_tokens server_tokens::deserialize(const llama_tokens & packed, bool has_mtmd) {
+    static_assert(sizeof(llama_token) == sizeof(uint32_t), "unexpected llama_token size");
+
+    if (packed.empty() || packed[0] != LLAMA_TOKEN_NULL) {
+        // plain token list
+        return server_tokens(packed, has_mtmd);
+    }
+
+    server_tokens_state_reader reader(reinterpret_cast<const char *>(packed.data()), packed.size() * sizeof(llama_token));
+    reader.read<llama_token>(); // format marker
+    if (reader.read<uint32_t>() != SERVER_TOKENS_STATE_VERSION) {
+        throw std::runtime_error("Unsupported server tokens state version");
+    }
+
+    const llama_tokens tokens = reader.read_vector<llama_token>();
+
+    if (!reader.read_vector<uint32_t>().empty()) {
+        throw std::runtime_error("Cannot load media chunks in server tokens state");
+    }
+
+    if (reader.remaining() >= sizeof(llama_token)) {
+        throw std::runtime_error("Trailing data in server tokens state");
+    }
+
+    return server_tokens(tokens, has_mtmd);
 }
 
 llama_tokens server_tokens::get_text_tokens() const {

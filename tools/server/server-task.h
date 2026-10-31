@@ -5,7 +5,9 @@
 
 #include <string>
 #include <unordered_set>
+#include <filesystem>
 #include <list>
+#include <memory>
 #include <map>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -636,13 +638,16 @@ struct server_prompt {
     }
 };
 
+struct server_prompt_cache_disk;
+
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens);
+    ~server_prompt_cache();
 
     std::list<server_prompt> states;
+
+    // second level on disk (--cache-disk): takes the states evicted from RAM, nullptr if disabled
+    std::unique_ptr<server_prompt_cache_disk> disk;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -660,7 +665,7 @@ struct server_prompt_cache {
     // protect the entry that restores the most of tokens until the next update()
     void protect(const server_tokens & tokens);
 
-    // the longest common prefix of tokens with a cached prompt, restorable or not
+    // the longest common prefix of tokens with a cached prompt (RAM or disk), restorable or not
     size_t n_common_prefix(const server_tokens & tokens) const;
 
     // the size of the root entries, at most half of limit_size
@@ -685,5 +690,16 @@ struct server_prompt_cache {
     // load() for rolls_back_to_checkpoints
     bool load_checkpointed(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
+    // longest prefix of tokens_new that load() would restore from a cached prompt (RAM or disk),
+    // for a slot that restores lcp_base tokens of it; lcp_base if there is none
+    size_t n_lcp_best(const server_tokens & tokens_new, size_t n_tokens_max, size_t lcp_base) const;
+
     void update();
+
+    // remove a state, handing it to the disk level if there is one
+    void evict(std::list<server_prompt>::iterator it);
+
+    // hand all states to the disk level, newest first, and optionally wait until they are written
+    // t_newest is the last use given to the newest state, the older ones get earlier times
+    void flush_to_disk(bool wait, std::filesystem::file_time_type t_newest);
 };

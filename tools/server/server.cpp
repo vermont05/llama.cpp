@@ -19,10 +19,26 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <cerrno>
+#include <unistd.h>
 #endif
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+// the signal handler only wakes this thread: the shutdown locks the task queue, which the main thread
+// holds while it enters or leaves the sleeping state, so running it inside the handler can deadlock
+static int signal_pipe[2] = { -1, -1 };
+
+static void signal_thread() {
+    int signal = 0;
+    while (read(signal_pipe[0], &signal, sizeof(signal)) < 0 && errno == EINTR) {
+    }
+    shutdown_handler(signal);
+}
+#endif
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -31,6 +47,14 @@ static inline void signal_handler(int signal) {
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
         exit(1);
     }
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    if (signal_pipe[1] >= 0) {
+        const ssize_t n = write(signal_pipe[1], &signal, sizeof(signal));
+        (void) n;
+        return;
+    }
+#endif
 
     shutdown_handler(signal);
 }
@@ -322,6 +346,10 @@ int llama_server(int argc, char ** argv) {
 
     // TODO: refactor in common/console
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    if (pipe(signal_pipe) == 0) {
+        std::thread(signal_thread).detach();
+    }
+
     struct sigaction sigint_action;
     sigint_action.sa_handler = signal_handler;
     sigemptyset (&sigint_action.sa_mask);

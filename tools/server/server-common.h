@@ -196,6 +196,11 @@ public:
 
     llama_tokens get_text_tokens() const;
 
+    // packed form for the disk prompt cache; media chunks are not supported in this tree (no mtmd_input_chunk_save),
+    // serialize() throws if there are any
+    std::vector<char> serialize() const;
+    static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
+
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
 
