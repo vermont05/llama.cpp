@@ -173,6 +173,9 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // s_copy() without resetting the rollback index
+    int32_t s_copy_peek(int i) const;
+
 private:
     const llama_memory_status status;
 

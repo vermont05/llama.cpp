@@ -327,7 +327,16 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // more than one sequence, each reads the state in its own cell (no other sequence of the ubatch writes there) and
+    // no extra states move: a backend may read the states in place instead of the gather, see llm_graph_rs_rows_safe()
+    bool rows_safe = false;
 };
+
+// the state gather of a ubatch with rows_safe is tagged with this in op_params[0] of its GGML_OP_GET_ROWS
+#define LLAMA_GRAPH_RS_ROWS_SAFE 0x52535246
+
+bool llm_graph_rs_rows_safe(const llama_memory_recurrent_context * mctx_cur, int64_t n_seqs);
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
 public:

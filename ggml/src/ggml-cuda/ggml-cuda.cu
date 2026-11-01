@@ -2964,9 +2964,14 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
-// Find single-seq gated_delta_net nodes whose input state is a get_rows gather of the cache rows and
-// which write the new state back to the cache. Such a gdn can read the cache row itself, so the gather
-// is skipped. Each kernel block reads and writes only its own part of the state, so in-place is safe.
+// llama tags a state gather of several sequences with this (LLAMA_GRAPH_RS_ROWS_SAFE, op_params[0]) when each
+// sequence reads the cell it writes or one no other sequence of the ubatch writes
+#define GGML_CUDA_RS_ROWS_SAFE 0x52535246
+
+// Find gated_delta_net nodes whose input state is a get_rows gather of the cache rows and which write the
+// new state back to the cache. Such a gdn can read the cache rows itself, so the gather is skipped. Each
+// kernel block reads and writes only its own part of its sequence's state, so in-place is safe for one
+// sequence, and for several when llama tagged the gather (no sequence reads a row another one writes).
 static void ggml_cuda_find_gdn_rows(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
     cuda_ctx->gdn_rows.clear();
     cuda_ctx->gdn_rows_skip.clear();
@@ -2978,9 +2983,10 @@ static void ggml_cuda_find_gdn_rows(ggml_backend_cuda_context * cuda_ctx, const 
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * gdn = cgraph->nodes[i];
-        if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] != nullptr || gdn->src[2]->ne[3] != 1) {
+        if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] != nullptr) {
             continue;
         }
+        const int64_t n_seqs = gdn->src[2]->ne[3];
         ggml_cuda_gated_delta_net_fused_cache fc;
         if (ggml_cuda_try_gdn_cache_fusion(cgraph, i, fc) == 0) {
             continue;
@@ -2997,11 +3003,14 @@ static void ggml_cuda_find_gdn_rows(ggml_backend_cuda_context * cuda_ctx, const 
         if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             continue;
         }
+        if (n_seqs > 1 && gr->op_params[0] != GGML_CUDA_RS_ROWS_SAFE) {
+            continue;
+        }
         const ggml_tensor * states = gr->src[0];
         const ggml_tensor * ids    = gr->src[1];
-        const int64_t       D      = ggml_nelements(gdn->src[5]);
-        if (states->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || ids->ne[0] != 1 || ggml_nelements(ids) != 1 ||
-            states->ne[0] != D || states->nb[0] != sizeof(float) || ggml_nelements(gr) != D) {
+        const int64_t       D      = ggml_nelements(gdn->src[5]) / n_seqs; // per sequence
+        if (states->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || ids->ne[0] != n_seqs || ggml_nelements(ids) != n_seqs ||
+            states->ne[0] != D || states->nb[0] != sizeof(float) || ggml_nelements(gr) != D * n_seqs) {
             continue;
         }
 

@@ -525,7 +525,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
         cb(state, "state_cache_view", il);
     } else {
-        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        // tag the gather when the states can be read in place (the CUDA backend then skips it for several sequences
+        // too, as it does for one)
+        const bool rows_safe = inp->rows_safe;
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs,
+                [rows_safe](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
+                    ggml_tensor * rows = ggml_get_rows(ctx, states, ids);
+                    if (rows_safe) {
+                        rows->op_params[0] = LLAMA_GRAPH_RS_ROWS_SAFE;
+                    }
+                    return rows;
+                });
         state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
         cb(state, "state_predelta", il);
     }

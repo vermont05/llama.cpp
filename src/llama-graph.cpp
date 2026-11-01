@@ -385,6 +385,7 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
 
     res &= head == mctx_cur->get_head();
     res &= rs_z == mctx_cur->get_rs_z();
+    res &= rows_safe == llm_graph_rs_rows_safe(mctx_cur, params.ubatch.n_seqs);
 
     return res;
 }
@@ -3514,6 +3515,23 @@ ggml_tensor * llm_graph_context::build_rs(
     return output_states;
 }
 
+bool llm_graph_rs_rows_safe(const llama_memory_recurrent_context * mctx_cur, int64_t n_seqs) {
+    if (n_seqs < 2 || (int64_t) mctx_cur->get_n_rs() != n_seqs) {
+        return false;
+    }
+
+    const int64_t size = mctx_cur->get_size();
+    const int64_t head = mctx_cur->get_head();
+    for (int64_t i = 0; i < n_seqs; ++i) {
+        const int64_t cell = mctx_cur->s_copy_peek(i) % size;
+        if (cell >= head && cell < head + n_seqs && cell != head + i) {
+            return false; // reads the cell another sequence of the ubatch writes
+        }
+    }
+
+    return true;
+}
+
 static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
@@ -3532,6 +3550,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->rows_safe = llm_graph_rs_rows_safe(mctx_cur, n_seqs);
 
     return inp;
 }
