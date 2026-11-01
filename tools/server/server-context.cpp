@@ -17,6 +17,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h" // staging API: llama_memory_n_free_cells (used by schedule_kv)
 
 #include <algorithm>
 #include <cstddef>
@@ -61,6 +62,7 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_PREEMPTED,  // the state of its sequence is in host memory to free the K/V cells, see schedule_kv()
 };
 
 struct server_slot; // forward declaration
@@ -357,6 +359,69 @@ struct server_slot {
         return res;
     }
 
+    // preempted: the state of the sequence while its K/V cells are freed, and the state the slot resumes in
+    server_prompt_data preempted_data;
+    slot_state         preempted_state = SLOT_STATE_IDLE;
+
+    // move the state of the sequence to host memory and free its K/V cells; the slot keeps its prompt and generation
+    // state (sampler, draft and MTP carry-over are per slot) and goes on after resume()
+    bool preempt() {
+        GGML_ASSERT(state != SLOT_STATE_PREEMPTED && spec_i_batch.empty());
+
+        const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        try {
+            preempted_data.main.resize(size_tgt);
+            preempted_data.drft.resize(size_dft);
+        } catch (const std::bad_alloc & e) {
+            SLT_WRN(*this, "failed to allocate memory to preempt the slot: %s\n", e.what());
+            preempted_data = {};
+            return false;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        llama_state_seq_get_data_ext(ctx_tgt, preempted_data.main.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft) {
+            llama_state_seq_get_data_ext(ctx_dft, preempted_data.drft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        mem.seq_rm(id, -1, -1);
+
+        preempted_state = state;
+        state           = SLOT_STATE_PREEMPTED;
+        i_batch         = -1;
+
+        SLT_WRN(*this, "preempted: %d tokens, %.1f MiB to host memory in %.1f ms\n", prompt.n_tokens(),
+                preempted_data.size() / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+
+        return true;
+    }
+
+    bool resume() {
+        GGML_ASSERT(state == SLOT_STATE_PREEMPTED);
+
+        const int64_t t_start = ggml_time_us();
+
+        bool ok = llama_state_seq_set_data_ext(ctx_tgt, preempted_data.main.data(), preempted_data.main.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE) != 0;
+        if (ok && ctx_dft) {
+            ok = llama_state_seq_set_data_ext(ctx_dft, preempted_data.drft.data(), preempted_data.drft.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE) != 0;
+        }
+        if (!ok) {
+            SLT_WRN(*this, "%s", "failed to restore the preempted state\n");
+            mem.seq_rm(id, -1, -1);
+            return false;
+        }
+
+        SLT_WRN(*this, "resumed: %d tokens in %.1f ms\n", prompt.n_tokens(), (ggml_time_us() - t_start) / 1000.0);
+
+        state          = preempted_state;
+        preempted_data = {};
+
+        return true;
+    }
+
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
@@ -576,6 +641,12 @@ struct server_slot {
 
             t_last_used = ggml_time_us();
 
+            if (state == SLOT_STATE_PREEMPTED) {
+                // its cells are gone: drop the prompt with the state
+                preempted_data = {};
+                prompt.clear();
+            }
+
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
@@ -744,6 +815,26 @@ struct server_slot {
         }
 
         return res;
+    }
+
+    // LLAMA_SLOT_ATTACH: take the prompt of slot src up to its checkpoint at n_usable tokens by sharing its K/V cells
+    // (seq_cp in a unified K/V cache adds this slot's id to the cells, nothing is copied) and copies of its checkpoints
+    // up to there; the launch then rolls the slot back to that checkpoint, as for a prompt of its own, and the recurrent
+    // state is restored into a cell of this slot (so src's state is never written)
+    void prompt_attach(const server_slot & src, size_t n_usable) {
+        mem.seq_rm(id, -1, -1);
+        mem.seq_cp(src.id, id, -1, -1);
+
+        prompt.tokens = src.prompt.tokens.clone();
+        prompt.checkpoints.clear();
+        for (const auto & ckpt : src.prompt.checkpoints) {
+            if ((size_t) ckpt.n_tokens <= n_usable) {
+                prompt.checkpoints.push_back(ckpt);
+            }
+        }
+
+        SLT_INF(*this, "attached to slot %d: shares its K/V cells for %zu tokens (%zu checkpoints)\n",
+                src.id, n_usable, prompt.checkpoints.size());
     }
 
     void copy_state_to(server_slot & other) const {
@@ -953,6 +1044,10 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+
+    // LLAMA_SLOT_ATTACH=1: a slot takes a prefix of another slot's prompt by sharing its K/V cells (needs --kv-unified,
+    // no context shift, the prompt cache)
+    bool slot_attach = false;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1321,6 +1416,15 @@ private:
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
+
+        slot_attach = getenv("LLAMA_SLOT_ATTACH") && atoi(getenv("LLAMA_SLOT_ATTACH")) != 0;
+        if (slot_attach && (!params_base.kv_unified || params_base.ctx_shift || params_base.n_parallel < 2)) {
+            SRV_WRN("%s\n", "LLAMA_SLOT_ATTACH needs --kv-unified, no context shift and more than one slot: disabled");
+            slot_attach = false;
+        }
+        if (slot_attach) {
+            SRV_INF("%s\n", "slots attach to the K/V cells of other slots for a shared prefix (LLAMA_SLOT_ATTACH)");
+        }
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
@@ -1775,6 +1879,35 @@ private:
             }
         }
 
+        // a prefix of another slot's prompt that the task shares, restorable at one of its checkpoints and longer than
+        // what the slot and the prompt cache restore: attach to it instead of loading a copy
+        const server_slot * attach_src = nullptr;
+        size_t attach_n = 0;
+        size_t lcp_other = 0; // the longest prefix the task shares with another slot's prompt
+        if (ret && slot_attach && prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
+            const size_t n_own   = prompt_cache->n_usable(ret->prompt, ret->prompt.tokens.get_common_prefix(task.tokens));
+            const size_t n_cache = prompt_cache->n_lcp_best(task.tokens, llama_n_ctx_seq(ctx_tgt), n_own);
+            const size_t n_best  = std::max(n_own, n_cache);
+            for (const server_slot & slot : slots) {
+                if (&slot == ret || slot.prompt.tokens.empty() || slot.state == SLOT_STATE_PREEMPTED) {
+                    continue;
+                }
+                const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+                lcp_other = std::max(lcp_other, lcp);
+                if (lcp >= slot.prompt.tokens.size()) {
+                    continue; // only through a checkpoint: the slot's own recurrent state is never shared for decoding
+                }
+                const size_t n = prompt_cache->n_usable(slot.prompt, lcp);
+                if (n >= n_best + n_lcp_cache_min && n > attach_n) {
+                    attach_src = &slot;
+                    attach_n   = n;
+                }
+            }
+            if (attach_src) {
+                update_cache = true; // save the slot's prompt before it is replaced
+            }
+        }
+
         if (ret) {
             ret->n_shared = -1;
 
@@ -1791,9 +1924,10 @@ private:
                 const bool use_root = prompt_cache->rolls_back_to_checkpoints && params_base.checkpoint_root > 0;
 
                 // the prefix the task shares with an earlier prompt, restorable or not: if it cannot resume there, it
-                // gets a checkpoint there (n_shared), so that the next one that shares it can
-                const size_t n_shared = use_root ?
-                    std::max(ret->prompt.tokens.get_common_prefix(task.tokens), prompt_cache->n_common_prefix(task.tokens)) : 0;
+                // gets a checkpoint there (n_shared), so that the next one that shares it can (with LLAMA_SLOT_ATTACH also
+                // a prefix of another slot's prompt, e.g. the tools a subagent shares with the main conversation)
+                const size_t n_shared = use_root ? std::max({ ret->prompt.tokens.get_common_prefix(task.tokens),
+                    prompt_cache->n_common_prefix(task.tokens), lcp_other }) : 0;
 
                 // saving the slot must not evict the entry the task resumes from
                 prompt_cache->protect(task.tokens);
@@ -1804,7 +1938,9 @@ private:
                     ret->prompt_save_root(*prompt_cache, prompt_cache->n_usable(ret->prompt, ret->prompt.tokens.get_common_prefix(task.tokens)));
                 }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (attach_src) {
+                    ret->prompt_attach(*attach_src, attach_n);
+                } else if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
@@ -1872,6 +2008,174 @@ private:
         }
 
         return res;
+    }
+
+    // free K/V cells for the next step: the least of the target and draft memories, -1 if unknown
+    int64_t n_free_cells() const {
+        int64_t res = llama_memory_n_free_cells(ctx_tgt);
+        if (res >= 0 && ctx_dft) {
+            const int64_t res_dft = llama_memory_n_free_cells(ctx_dft);
+            if (res_dft >= 0) {
+                res = std::min(res, res_dft);
+            }
+        }
+
+        return res;
+    }
+
+    // clear the least recently used idle slot that holds a prompt, saving it to the prompt cache first
+    bool clear_idle_slot() {
+        server_slot * lru = nullptr;
+        for (auto & slot : slots) {
+            if (!slot.is_processing() && slot.prompt.n_tokens() > 0 && (!lru || slot.t_last_used < lru->t_last_used)) {
+                lru = &slot;
+            }
+        }
+        if (!lru) {
+            return false;
+        }
+
+        SRV_WRN("K/V cells are short: clearing idle slot %d with %d tokens\n", lru->id, lru->prompt.n_tokens());
+        if (prompt_cache) {
+            lru->prompt_save(*prompt_cache);
+            prompt_cache->update();
+        }
+        lru->prompt_clear();
+
+        return true;
+    }
+
+    bool any_preempted() const {
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PREEMPTED) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // headroom a preempted slot leaves to the older requests when it resumes, so that it is not preempted again soon
+    static constexpr int64_t n_resume_headroom = 4096;
+
+    // the least of a prompt that a step must be able to take for the slot to count as fitting
+    static constexpr int64_t n_prompt_step_min = 256;
+
+    // --kv-unified: the slots take K/V cells from one pool, and a full pool fails every request in it. Before each step,
+    // as vLLM schedules: the requests are served oldest first; when the pool cannot take the step, the idle slots'
+    // prompts go first (to the prompt cache), then the newest request is preempted: the state of its sequence goes to
+    // host memory, its cells are freed, and it resumes (before any new task starts) once it fits again. Returns the
+    // number of prompt tokens the step can take after the generating slots, -1 for no limit
+    int64_t schedule_kv() {
+        if (!params_base.kv_unified || slots.size() < 2) {
+            return -1;
+        }
+
+        int64_t n_free = n_free_cells();
+        if (n_free < 0) {
+            return -1;
+        }
+
+        auto is_active = [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT ||
+                   slot.state == SLOT_STATE_DONE_PROMPT || slot.state == SLOT_STATE_GENERATING;
+        };
+
+        std::vector<server_slot *> active;
+        std::vector<server_slot *> paused;
+        for (auto & slot : slots) {
+            if (slot.is_processing() && (slot.task->is_parent() || slot.task->is_child())) {
+                return -1; // n_cmpl > 1 shares one prompt between slots: not scheduled
+            }
+            if (is_active(slot)) {
+                active.push_back(&slot);
+            } else if (slot.state == SLOT_STATE_PREEMPTED) {
+                paused.push_back(&slot);
+            }
+        }
+        const auto older = [](const server_slot * a, const server_slot * b) { return a->task->id < b->task->id; };
+        std::sort(active.begin(), active.end(), older);
+        std::sort(paused.begin(), paused.end(), older);
+
+        // the cells a slot takes in the next step
+        auto n_step = [&](const server_slot & slot) -> int64_t {
+            const slot_state st = slot.state == SLOT_STATE_PREEMPTED ? slot.preempted_state : slot.state;
+            if (st == SLOT_STATE_GENERATING) {
+                return 1 + std::max<int64_t>(slot.get_n_draft_max(), slot.spec_draft.size());
+            }
+            if (st == SLOT_STATE_STARTED || st == SLOT_STATE_PROCESSING_PROMPT) {
+                return std::clamp<int64_t>(slot.task->n_tokens() - slot.prompt.n_tokens(), 1, n_prompt_step_min);
+            }
+            return 0;
+        };
+
+        int64_t n_need = 0;
+        for (auto * slot : active) {
+            n_need += n_step(*slot);
+        }
+
+        while (n_free < n_need && clear_idle_slot()) {
+            n_free = n_free_cells();
+        }
+
+        bool preempted = false;
+        while (n_free < n_need && active.size() > 1) {
+            server_slot & slot = *active.back();
+            active.pop_back();
+            n_need -= n_step(slot);
+
+            SRV_WRN("K/V cells are short (%" PRId64 " free, the step takes %" PRId64 "): preempting the newest request, slot %d\n",
+                    n_free, n_need + n_step(slot), slot.id);
+            if (slot.preempt()) {
+                paused.insert(paused.begin(), &slot);
+                preempted = true;
+            } else {
+                send_error(slot, "the context is full and the request could not be preempted", ERROR_TYPE_SERVER);
+                slot.release();
+                slot.prompt_clear();
+            }
+            n_free = n_free_cells();
+        }
+
+        // resume the oldest preempted request once it fits with headroom for the active ones; it alone always fits
+        if (!preempted && !paused.empty()) {
+            std::sort(paused.begin(), paused.end(), older);
+            server_slot & slot = *paused.front();
+
+            const int64_t n_cells  = slot.prompt.n_tokens() + n_step(slot);
+            auto          n_needed = [&]() { return n_need + n_cells + (active.empty() ? 0 : n_resume_headroom); };
+
+            while (n_free < n_needed() && clear_idle_slot()) {
+                n_free = n_free_cells();
+            }
+            if (n_free >= n_needed()) {
+                if (slot.resume()) {
+                    active.push_back(&slot);
+                    n_need += n_step(slot);
+                } else {
+                    send_error(slot, "failed to resume the preempted request", ERROR_TYPE_SERVER);
+                    slot.release();
+                }
+                n_free = n_free_cells();
+
+                // the tasks held back while it was preempted
+                if (!any_preempted()) {
+                    queue_tasks.pop_deferred_task(-1);
+                }
+            } else if (active.empty()) {
+                send_error(slot, "the preempted request does not fit in the context", ERROR_TYPE_SERVER);
+                slot.release();
+            }
+        }
+
+        int64_t n_gen = 0;
+        for (auto * slot : active) {
+            if (slot->state == SLOT_STATE_GENERATING) {
+                n_gen += n_step(*slot);
+            }
+        }
+
+        return std::max<int64_t>(0, n_free - n_gen);
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -2652,6 +2956,13 @@ private:
 
                     const int id_task = task.id;
 
+                    // a preempted request resumes before a new one starts
+                    if (any_preempted()) {
+                        SRV_DBG("a request is preempted, defer task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -3228,6 +3539,8 @@ private:
             }
         });
 
+        const int64_t n_prompt_budget = schedule_kv();
+
         // start populating the batch for this iteration
         batch.clear();
 
@@ -3369,6 +3682,18 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
+        // LLAMA_PROMPT_CHUNK_GEN=n: at most n prompt tokens in a batch that also carries generated tokens, so that a
+        // long prompt in one slot slows the others' generation less (it then takes longer itself: the GPU time is the same)
+        static const int32_t n_prompt_gen = getenv("LLAMA_PROMPT_CHUNK_GEN") ? std::max(0, atoi(getenv("LLAMA_PROMPT_CHUNK_GEN"))) : 0;
+        if (n_prompt_gen > 0 && batch.size() > 0) {
+            n_batch = std::min(n_batch, (int32_t) batch.size() + n_prompt_gen);
+        }
+
+        // the prompt tokens that fit in the free K/V cells, see schedule_kv()
+        if (n_prompt_budget >= 0) {
+            n_batch = (int32_t) std::min<int64_t>(n_batch, batch.size() + n_prompt_budget);
+        }
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
