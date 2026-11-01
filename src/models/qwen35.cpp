@@ -758,7 +758,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    // LLAMA_MTP_DRAFT_VOCAB=n: draft over the first n token ids only (BPE ids come roughly by frequency), the rest of
+    // the logits are 0 and not read by the draft sampler (common_speculative_n_vocab_draft); the head is the largest
+    // matrix of the draft step
+    static const int64_t n_vocab_draft = getenv("LLAMA_MTP_DRAFT_VOCAB") ? atoll(getenv("LLAMA_MTP_DRAFT_VOCAB")) : 0;
+    if (n_vocab_draft > 0 && n_vocab_draft < head_w->ne[1]) {
+        cur = build_lora_mm(head_w, cur, head_s, n_vocab_draft);
+        cur = ggml_pad(ctx0, cur, head_w->ne[1] - n_vocab_draft, 0, 0, 0);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

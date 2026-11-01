@@ -1506,7 +1506,8 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+              int64_t   n_rows) const {
     ggml_tensor * cur_mm = cur;
     if (hadamard_rotations) {
         const auto it = hadamard_rotations->find(w);
@@ -1535,13 +1536,22 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         }
     }
 
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
+    ggml_tensor * w_mm = w;
+    if (n_rows > 0 && n_rows < w->ne[1]) {
+        GGML_ASSERT(ggml_n_dims(w) == 2);
+        w_mm = ggml_view_2d(ctx0, w, w->ne[0], n_rows, w->nb[1], 0);
+    }
+
+    ggml_tensor * res = ggml_mul_mat(ctx0, w_mm, cur_mm);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
     }
 
     for (const auto & lora : *loras) {
+        if (w_mm != w) {
+            break;
+        }
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {
             continue;

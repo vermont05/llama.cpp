@@ -1703,7 +1703,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_token id;
                 if (dp.sampling && dp.result_q && dp.sampling->temp > 0.0f) {
                     // speculative sampling: sample the draft token from q and keep q for the verification
-                    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    // LLAMA_MTP_DRAFT_VOCAB=n: the draft head computes only the first n logits (see qwen35 MTP graph)
+                    static const int n_vocab_draft = getenv("LLAMA_MTP_DRAFT_VOCAB") ? atoi(getenv("LLAMA_MTP_DRAFT_VOCAB")) : 0;
+                    const int n_vocab_full = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    const int n_vocab = n_vocab_draft > 0 ? std::min(n_vocab_draft, n_vocab_full) : n_vocab_full;
                     auto qd = common_speculative_draft_dist(llama_get_logits_ith(ctx_dft, i_last[seq_id]), n_vocab, *dp.sampling);
                     if (qd[0].p < params.p_min) {
                         drafting[seq_id] = false;
