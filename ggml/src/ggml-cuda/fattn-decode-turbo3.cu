@@ -88,8 +88,9 @@ static __device__ __forceinline__ void fattn_dt3_wht(float * x, const int n_grp,
 #define PRISM_FA_DT3_WAVES_PER_EU 4
 #endif
 
-// G: Q heads per K/V head, NQ: Q tokens (1, or 2-3 for the MTP verify step), GH: Q heads per block (a divisor of G;
-// with GH < G the G/GH blocks of a K/V head each read it, so that 3 tokens still fit in 16 virtual heads)
+// G: Q heads per K/V head, NQ: Q tokens (1, or 2-4 for the MTP verify step, 4 with two slots in a unified K/V cache),
+// GH: Q heads per block (a divisor of G; with GH < G the G/GH blocks of a K/V head each read it, so that 3-4 tokens
+// still fit in 16 virtual heads)
 template <int G, int NQ, int GH = G>
 #ifdef GGML_USE_HIP
 __attribute__((amdgpu_flat_work_group_size(fattn_dt3_nwarps*WARP_SIZE, fattn_dt3_nwarps*WARP_SIZE), amdgpu_waves_per_eu(PRISM_FA_DT3_WAVES_PER_EU)))
@@ -281,6 +282,17 @@ static __global__ void flash_attn_ext_decode_turbo3_0(
         fattn_dt3_wave_sync();
         if (t0 + gridDim.y*fattn_dt3_tile < k_VKQ_max) {
             load_tile(row0 + gridDim.y*fattn_dt3_tile);
+        }
+
+        // rows masked for every token (with a unified K/V cache, the cells of other sequences) add exactly nothing:
+        // the maxima stay, alpha = 1 and P = 0, so skip the warp's tile
+        bool live = false;
+#pragma unroll
+        for (int p = 0; p < R/2; ++p) {
+            live = live || mk[p] != -INFINITY;
+        }
+        if (!__builtin_amdgcn_ballot_w32(live)) {
+            continue;
         }
 
         // S = Q K^T for the warp's R rows, 2 rows at a time.
@@ -531,7 +543,7 @@ bool ggml_cuda_flash_attn_ext_decode_turbo3_supported(const ggml_tensor * dst) {
     if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_TURBO3_0 || V->type != GGML_TYPE_TURBO3_0) {
         return false;
     }
-    if (Q->ne[0] != fattn_dt3_D || K->ne[0] != fattn_dt3_D || V->ne[0] != fattn_dt3_D || Q->ne[1] > 3) {
+    if (Q->ne[0] != fattn_dt3_D || K->ne[0] != fattn_dt3_D || V->ne[0] != fattn_dt3_D || Q->ne[1] > 4) {
         return false;
     }
     if (!mask || sinks || max_bias != 0.0f || logit_softcap != 0.0f || mask->type != GGML_TYPE_F16) {
@@ -547,8 +559,8 @@ bool ggml_cuda_flash_attn_ext_decode_turbo3_supported(const ggml_tensor * dst) {
     if (Q->ne[1] == 2 && gqa_ratio == 8) {
         return false; // 16 virtual heads spill (256 VGPRs + scratch)
     }
-    if (Q->ne[1] == 3 && gqa_ratio != 6) {
-        return false; // 3 tokens: only 2 blocks x 3 heads per K/V head
+    if (Q->ne[1] >= 3 && gqa_ratio != 6) {
+        return false; // 3-4 tokens: only 2 blocks x 3 heads per K/V head
     }
     if ((uintptr_t) K->data % 4 != 0 || (uintptr_t) V->data % 4 != 0 || (uintptr_t) Q->data % 16 != 0) {
         return false;
@@ -584,6 +596,32 @@ void ggml_cuda_flash_attn_ext_decode_turbo3(ggml_backend_cuda_context & ctx, ggm
         case 42: ggml_cuda_flash_attn_ext_decode_turbo3_case<4, 2>(ctx, dst); break;
         case 62: ggml_cuda_flash_attn_ext_decode_turbo3_case<6, 2>(ctx, dst); break;
         case 63: ggml_cuda_flash_attn_ext_decode_turbo3_case<6, 3, 3>(ctx, dst); break;
+        case 64: {
+            // 4 tokens are, in practice, two slots' MTP verify pairs in a unified K/V cache: as two 2-token launches
+            // each pair skips the tiles of the other slot's cells (all masked for it), where one 4-token launch reads
+            // every cell for all 4 (PRISM_FA_DT3_SPLIT4=0: one launch)
+            static const bool split4 = !getenv("PRISM_FA_DT3_SPLIT4") || atoi(getenv("PRISM_FA_DT3_SPLIT4")) != 0;
+            if (!split4) {
+                ggml_cuda_flash_attn_ext_decode_turbo3_case<6, 4, 3>(ctx, dst);
+                break;
+            }
+            const ggml_tensor * Q    = dst->src[0];
+            const ggml_tensor * mask = dst->src[3];
+            for (int h = 0; h < 2; ++h) {
+                ggml_tensor Q_h    = *Q;
+                ggml_tensor mask_h = *mask;
+                ggml_tensor dst_h  = *dst;
+                Q_h.data     = (char *) Q->data    + 2*h*Q->nb[1];
+                Q_h.ne[1]    = 2;
+                mask_h.data  = (char *) mask->data + 2*h*mask->nb[1];
+                mask_h.ne[1] = mask->ne[1] - 2*h;
+                dst_h.data   = (char *) dst->data  + 2*h*dst->nb[2];
+                dst_h.ne[2]  = 2;
+                dst_h.src[0] = &Q_h;
+                dst_h.src[3] = &mask_h;
+                ggml_cuda_flash_attn_ext_decode_turbo3_case<6, 2>(ctx, &dst_h);
+            }
+        } break;
         default: GGML_ABORT("unsupported gqa ratio / token count");
     }
 }
