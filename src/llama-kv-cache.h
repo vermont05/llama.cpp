@@ -156,6 +156,9 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // cells that hold no token, over all streams
+    uint32_t get_n_free()   const;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;

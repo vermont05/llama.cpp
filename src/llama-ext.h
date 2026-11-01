@@ -90,6 +90,10 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// K/V cells of the context's memory that hold no token (over all streams), -1 if the memory has no plain K/V cache
+// (none, recurrent only, or sliding window)
+LLAMA_API int64_t llama_memory_n_free_cells(const struct llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

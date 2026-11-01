@@ -3891,6 +3891,18 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
+int64_t llama_memory_n_free_cells(const llama_context * ctx) {
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv->get_n_free();
+    }
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hyb->get_mem_attn()->get_n_free();
+    }
+
+    return -1;
+}
+
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
