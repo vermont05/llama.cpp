@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "ptq1-wmma.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1601,6 +1602,13 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    // plain PTQ1_0 products of 2..8 columns (the speculative verify of one or more slots) on the int8 WMMA
+    if (src0->type == GGML_TYPE_PTQ1_0 && !ids && !fusion && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mul_mat_ptq1_0_wmma(ctx, src0->data, src1_q8_1_d, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y,
+                                          stride_col_dst, stream)) {
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
