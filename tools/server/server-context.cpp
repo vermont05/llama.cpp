@@ -1049,6 +1049,10 @@ private:
     // no context shift, the prompt cache)
     bool slot_attach = false;
 
+    // a generated token before which a slot makes a checkpoint (the tool-call start), LLAMA_TOKEN_NULL for none, see
+    // pre_decode()
+    llama_token gen_ckpt_token = LLAMA_TOKEN_NULL;
+
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
@@ -1424,6 +1428,20 @@ private:
         }
         if (slot_attach) {
             SRV_INF("%s\n", "slots attach to the K/V cells of other slots for a shared prefix (LLAMA_SLOT_ATTACH)");
+        }
+
+        // LLAMA_GEN_CHECKPOINT=<text>: the single token before which generation makes a checkpoint (default "<tool_call>",
+        // "0" disables)
+        {
+            const char * env = getenv("LLAMA_GEN_CHECKPOINT");
+            const std::string text = env ? env : "<tool_call>";
+            if (text != "0" && params_base.n_ctx_checkpoints > 0) {
+                const auto ids = common_tokenize(vocab, text, false, true);
+                if (ids.size() == 1) {
+                    gen_ckpt_token = ids[0];
+                    SRV_INF("generation makes a checkpoint before '%s' (token %d)\n", text.c_str(), gen_ckpt_token);
+                }
+            }
         }
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
@@ -3554,6 +3572,21 @@ private:
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
+            }
+
+            // a checkpoint before a tool call: the client sends the call back re-rendered from its parsed form, so the
+            // next prompt diverges in it, and a memory that rolls back only to checkpoints would otherwise go back to the
+            // end of the prompt and re-read the whole reply. The sampled token is not in the memory yet, and with an empty
+            // draft (not replaying a partial acceptance) the memory holds exactly the slot's tokens
+            if (gen_ckpt_token != LLAMA_TOKEN_NULL && slot.sampled == gen_ckpt_token && slot.spec_draft.empty() &&
+                    slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS)) {
+                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                if (pos_min >= 0) {
+                    create_checkpoint(slot, 0, pos_min, pos_max);
+                    SLT_INF(slot, "created a checkpoint before a tool call (n_tokens = %d)\n", slot.prompt.n_tokens());
+                }
             }
 
             // check if we can batch this slot with the previous one
