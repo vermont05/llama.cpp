@@ -888,7 +888,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (bf16_mma_hardware_available(cc)) {
-                    return ne11 <= 3;
+                    // thin matrices (e.g. ssm_alpha/ssm_beta, 48 rows) are launch-bound in rocBLAS
+                    const bool src0_small = src0_ne[1] <= 512;
+                    return ne11 <= 3 || (src0_small && ne11 <= MMVF_MAX_BATCH_SIZE);
                 }
                 return ne11 <= 8;
             }
