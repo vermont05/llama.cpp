@@ -24,6 +24,14 @@
 // file names start with a fingerprint of the model files and of the settings that change the KV contents,
 // so several models can share one directory. files of other fingerprints are never loaded, but they count
 // toward the size limit and are removed first when they are the least recently used.
+//
+// root entries (the shared tools / system prompt prefix, server_prompt_cache_state::root) are kept over
+// conversation entries: when room is needed, conversation entries and files of other fingerprints go first
+// (least recently used first), root entries only when nothing else is left. LLAMA_CACHE_DISK_TTL=<hours>
+// also removes conversation entries not used for that long (at startup and whenever a state is written), and
+// LLAMA_CACHE_DISK_ROOT_TTL=<hours> root entries; 0 or unset = no expiry. a root state is stored as its own small
+// file even when a conversation entry contains it, so it outlives that entry. root entries are evicted last only
+// while they hold at most a quarter of the size limit (one root per distinct system prompt).
 struct server_prompt_cache_disk {
     using time_point = std::filesystem::file_time_type;
 
@@ -90,6 +98,7 @@ private:
 
         bool on_disk = false;
         bool foreign = false; // file of another fingerprint: counts toward the limit, never loaded
+        bool root    = false; // the shared tools / system prompt prefix: evicted last, never expires
         bool writing = false;
         bool reading = false;
 
@@ -113,6 +122,9 @@ private:
     uint64_t fingerprint = 0;
     bool     has_mtmd    = false;
 
+    double ttl_hours      = 0.0; // LLAMA_CACHE_DISK_TTL: conversation entries unused for longer are removed, 0 = never
+    double root_ttl_hours = 0.0; // LLAMA_CACHE_DISK_ROOT_TTL: the same for root entries, 0 = never
+
     mutable std::mutex      mtx;
     std::condition_variable cv;
 
@@ -135,6 +147,7 @@ private:
     size_t size_on_disk() const;
     bool   make_room(size_t size_new, int64_t id_keep, time_point t_new);
     void   erase_entry(std::list<entry>::iterator it);
+    void   reap_expired(int64_t id_keep); // removes conversation entries unused for longer than ttl_hours, except id_keep
     void   drop_superseded(const entry & cur);
 
     // true if a holds the tokens of b or a continuation of them, and every checkpoint of b

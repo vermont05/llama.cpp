@@ -3,7 +3,9 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstdio>
 
 #if defined(_WIN32)
@@ -153,6 +155,16 @@ static bool ends_with(const std::string & str, const std::string & suffix) {
 
 server_prompt_cache_disk::server_prompt_cache_disk(const std::string & dir, size_t limit_size, size_t limit_pending, uint64_t fingerprint, bool has_mtmd)
     : dir(dir), prefix("pc-" + hex64(fingerprint) + "-"), limit_size(limit_size), limit_pending(limit_pending), fingerprint(fingerprint), has_mtmd(has_mtmd) {
+    if (const char * ttl = std::getenv("LLAMA_CACHE_DISK_TTL")) {
+        ttl_hours = std::max(0.0, std::atof(ttl));
+    }
+    if (const char * ttl = std::getenv("LLAMA_CACHE_DISK_ROOT_TTL")) {
+        root_ttl_hours = std::max(0.0, std::atof(ttl));
+    }
+    if (ttl_hours > 0 || root_ttl_hours > 0) {
+        SRV_INF("disk prompt cache: entries expire after %.1f h unused, root entries after %.1f h (0 = never); roots are evicted last "
+                "while they hold at most a quarter of the limit\n", ttl_hours, root_ttl_hours);
+    }
     scan();
 
     worker = std::thread([this]() { worker_loop(); });
@@ -238,7 +250,8 @@ void server_prompt_cache_disk::drop_superseded(const entry & cur) {
         auto next = std::next(it);
 
         // a waiting entry is left alone: fetch() may wait for it after a cancelled write
-        if (&*it != &cur && !it->busy() && !it->pending && !it->foreign && covers(cur.tokens, cur.ckpts, it->tokens, it->ckpts)) {
+        if (&*it != &cur && !it->busy() && !it->pending && !it->foreign && (!it->root || cur.root) &&
+                covers(cur.tokens, cur.ckpts, it->tokens, it->ckpts)) {
             SRV_TRC("disk prompt cache: removing prompt with %zu tokens, contained in the new one\n", it->tokens.size());
             erase_entry(it);
         }
@@ -247,7 +260,39 @@ void server_prompt_cache_disk::drop_superseded(const entry & cur) {
     }
 }
 
+void server_prompt_cache_disk::reap_expired(int64_t id_keep) {
+    if (ttl_hours <= 0 && root_ttl_hours <= 0) {
+        return;
+    }
+
+    const auto now     = time_point::clock::now();
+    const auto hours   = [](double h) { return std::chrono::duration_cast<time_point::duration>(std::chrono::duration<double, std::ratio<3600>>(h)); };
+    const auto cut     = ttl_hours      > 0 ? now - hours(ttl_hours)      : time_point::min();
+    const auto cut_rt  = root_ttl_hours > 0 ? now - hours(root_ttl_hours) : time_point::min();
+
+    size_t n_removed = 0, n_roots = 0;
+    size_t n_bytes   = 0;
+    for (auto it = entries.begin(); it != entries.end();) {
+        auto next = std::next(it);
+        // conversation entries and files of other fingerprints use the short TTL, root entries the long one
+        if (it->on_disk && !it->busy() && !it->pending && it->id != id_keep && it->t_used < (it->root ? cut_rt : cut)) {
+            n_removed++;
+            n_roots += it->root ? 1 : 0;
+            n_bytes += it->size;
+            erase_entry(it);
+        }
+        it = next;
+    }
+
+    if (n_removed > 0) {
+        SRV_INF("disk prompt cache: removed %zu expired entries (%zu root) unused for more than %.1f h (roots: %.1f h), %.3f MiB\n",
+                n_removed, n_roots, ttl_hours, root_ttl_hours, n_bytes / MiB);
+    }
+}
+
 bool server_prompt_cache_disk::make_room(size_t size_new, int64_t id_keep, time_point t_new) {
+    reap_expired(id_keep);
+
     if (limit_size > 0 && size_new > limit_size) {
         return false;
     }
@@ -273,14 +318,41 @@ bool server_prompt_cache_disk::make_room(size_t size_new, int64_t id_keep, time_
         return true;
     }
 
-    // least recently used files first, and only files used before the new state
+    // conversation entries and files of other fingerprints before root entries, least recently used first within each,
+    // and only files used before the new state
     std::vector<std::list<entry>::iterator> lru;
     for (auto it = entries.begin(); it != entries.end(); ++it) {
         if (it->on_disk && !it->busy() && !it->pending && it->id != id_keep && it->t_used < t_new) {
             lru.push_back(it);
         }
     }
-    std::sort(lru.begin(), lru.end(), [](const auto & a, const auto & b) { return a->t_used < b->t_used; });
+    // root entries are kept last while they hold at most a quarter of the limit; the oldest roots beyond that budget
+    // compete with the other entries (one root per distinct system prompt, so they could otherwise fill the cache)
+    std::vector<std::list<entry>::iterator> roots;
+    size_t root_bytes = 0;
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (it->on_disk && it->root) {
+            roots.push_back(it);
+            root_bytes += it->size;
+        }
+    }
+    std::sort(roots.begin(), roots.end(), [](const auto & a, const auto & b) { return a->t_used < b->t_used; });
+    std::vector<const entry *> demoted;
+    const size_t root_budget = limit_size > 0 ? limit_size / 4 : SIZE_MAX;
+    for (size_t i = 0; i < roots.size() && root_bytes > root_budget; ++i) {
+        demoted.push_back(&*roots[i]);
+        root_bytes -= roots[i]->size;
+    }
+    const auto protected_root = [&demoted](const entry & e) {
+        return e.root && std::find(demoted.begin(), demoted.end(), &e) == demoted.end();
+    };
+    std::sort(lru.begin(), lru.end(), [&protected_root](const auto & a, const auto & b) {
+        const bool pa = protected_root(*a), pb = protected_root(*b);
+        if (pa != pb) {
+            return !pa; // protected root entries last
+        }
+        return a->t_used < b->t_used;
+    });
 
     // count the freed bytes from the file sizes: a copy-on-write file system can report the free space later
     size_t n_free  = 0;
@@ -295,7 +367,7 @@ bool server_prompt_cache_disk::make_room(size_t size_new, int64_t id_keep, time_
 
     for (size_t i = 0; i < n_evict; ++i) {
         SRV_INF("disk prompt cache: removing least recently used %s with %zu tokens (%.3f MiB)\n",
-                lru[i]->foreign ? "file of another fingerprint" : "prompt", lru[i]->tokens.size(), lru[i]->size / MiB);
+                lru[i]->foreign ? "file of another fingerprint" : (lru[i]->root ? "root prompt" : "prompt"), lru[i]->tokens.size(), lru[i]->size / MiB);
 
         erase_entry(lru[i]);
     }
@@ -362,6 +434,7 @@ void server_prompt_cache_disk::scan() {
             e.path    = path;
             e.tokens  = std::move(state.prompt.tokens);
             e.ckpts   = ckpt_positions(state.prompt);
+            e.root    = state.root;
             e.size    = de.file_size();
             e.t_used  = de.last_write_time();
             e.on_disk = true;
@@ -398,8 +471,10 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
 
     std::lock_guard<std::mutex> lk(mtx);
 
+    // a root state is stored as its own (small) file even when a conversation entry contains it: conversation
+    // entries expire (LLAMA_CACHE_DISK_TTL) and the root must outlive them
     for (const auto & e : entries) {
-        if (!e.foreign && covers(e.tokens, e.ckpts, state.prompt.tokens, ckpts)) {
+        if (!e.foreign && (!state.root || e.root) && covers(e.tokens, e.ckpts, state.prompt.tokens, ckpts)) {
             SRV_TRC("disk prompt cache: prompt with %zu tokens is already stored, skipping\n", n_tokens);
             return;
         }
@@ -408,7 +483,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
     // waiting states that this one continues would be removed once it is written, drop them now
     for (auto it = entries.begin(); it != entries.end();) {
         auto next = std::next(it);
-        if (!it->on_disk && !it->busy() && covers(state.prompt.tokens, ckpts, it->tokens, it->ckpts)) {
+        if (!it->on_disk && !it->busy() && (!it->root || state.root) && covers(state.prompt.tokens, ckpts, it->tokens, it->ckpts)) {
             erase_entry(it);
         }
         it = next;
@@ -444,6 +519,7 @@ void server_prompt_cache_disk::put(server_prompt_cache_state && state, time_poin
     e.path     = fs_path_to_utf8(fs::u8path(dir) / fs::u8path(name));
     e.tokens   = state.prompt.tokens.clone();
     e.ckpts    = ckpts;
+    e.root     = state.root;
     e.size     = size_state;
     e.size_mem = size_state;
     e.t_used   = t_used;
